@@ -52,6 +52,10 @@ class EarningsCallDataset(Dataset):
     max_transcript_gap_days : int
         Maximum days between a filing and the next earnings announcement for
         the filing to be attached to that announcement's label.
+    use_audio : bool
+        Load audio features and return them in each sample.  Off by default:
+        the dataset is then text-only and samples without a transcript are
+        dropped.
     """
 
     def __init__(
@@ -61,10 +65,12 @@ class EarningsCallDataset(Dataset):
         audio_features_path: Optional[str | Path] = None,
         transcripts_dir: Optional[str | Path] = None,
         max_transcript_gap_days: int = 120,
+        use_audio: bool = False,
     ) -> None:
         super().__init__()
         self.data_root = Path(data_root)
         self.max_transcript_gap_days = max_transcript_gap_days
+        self.use_audio = use_audio
 
         # --- Labels ----------------------------------------------------------
         labels_path = Path(labels_path) if labels_path else self.data_root / "data" / "processed" / "labels.csv"
@@ -79,7 +85,8 @@ class EarningsCallDataset(Dataset):
         af_base = Path(audio_features_path) if audio_features_path else self.data_root / "data" / "processed" / "audio_features"
         self.audio_features: Dict[Tuple[str, str], np.ndarray] = {}
         self._audio_dim: int = 0
-        self._load_audio_features(af_base)
+        if self.use_audio:
+            self._load_audio_features(af_base)
 
         # --- Transcripts -----------------------------------------------------
         transcripts_dir = Path(transcripts_dir) if transcripts_dir else self.data_root / "data" / "raw" / "transcripts"
@@ -187,6 +194,7 @@ class EarningsCallDataset(Dataset):
     def _build_index(self) -> None:
         """Create the unified sample list from labels, attaching available modalities."""
         skipped_nan = 0
+        skipped_no_text = 0
         for _, row in self.labels_df.iterrows():
             # Skip rows with missing labels
             if pd.isna(row.get("label")):
@@ -194,6 +202,10 @@ class EarningsCallDataset(Dataset):
                 continue
             key = (str(row["ticker"]).upper(), str(row["date"]))
             transcript_key = self._match_transcript(*key)
+            # Text-only mode: a sample without a transcript has no input
+            if not self.use_audio and transcript_key is None:
+                skipped_no_text += 1
+                continue
             sample: Dict[str, Any] = {
                 "ticker": key[0],
                 "date": key[1],
@@ -205,6 +217,8 @@ class EarningsCallDataset(Dataset):
             self.samples.append(sample)
         if skipped_nan:
             logger.info("Skipped %d rows with missing labels", skipped_nan)
+        if skipped_no_text:
+            logger.info("Skipped %d rows with no matching transcript (text-only mode)", skipped_no_text)
 
     def _print_stats(self) -> None:
         n = len(self.samples)
@@ -219,15 +233,19 @@ class EarningsCallDataset(Dataset):
         n_has_audio = sum(s["has_audio_features"] for s in self.samples)
         n_both = sum(s["has_transcript"] and s["has_audio_features"] for s in self.samples)
 
+        audio_stats = (
+            f"  Audio features available: {n_has_audio}/{n}\n"
+            f"  Both modalities: {n_both}/{n}\n"
+            f"  Audio feature dim: {self._audio_dim}\n"
+            if self.use_audio else "  Audio: disabled (text-only)\n"
+        )
         stats = (
             f"\n{'=' * 50}\n"
             f"EarningsCallDataset — {n} samples\n"
             f"  Labels:  met=0 → {n_neg}  |  missed=1 → {n_pos}  "
             f"({n_pos / n * 100:.1f}% positive)\n"
             f"  Transcripts available: {n_has_text}/{n}\n"
-            f"  Audio features available: {n_has_audio}/{n}\n"
-            f"  Both modalities: {n_both}/{n}\n"
-            f"  Audio feature dim: {self._audio_dim}\n"
+            f"{audio_stats}"
             f"{'=' * 50}"
         )
         print(stats)
@@ -245,21 +263,23 @@ class EarningsCallDataset(Dataset):
         # Transcript
         text = self.transcripts.get(sample["transcript_key"], "") if sample["transcript_key"] else ""
 
-        # Audio features — zero vector when missing
-        if key in self.audio_features:
-            audio_feat = torch.from_numpy(self.audio_features[key])
-        else:
-            audio_feat = torch.zeros(max(self._audio_dim, 1), dtype=torch.float32)
-
-        return {
+        item: Dict[str, Any] = {
             "text": text,
-            "audio_features": audio_feat,
             "label": torch.tensor(sample["label"], dtype=torch.long),
             "ticker": sample["ticker"],
             "date": sample["date"],
             "has_transcript": sample["has_transcript"],
-            "has_audio_features": sample["has_audio_features"],
         }
+
+        if self.use_audio:
+            # Audio features — zero vector when missing
+            if key in self.audio_features:
+                item["audio_features"] = torch.from_numpy(self.audio_features[key])
+            else:
+                item["audio_features"] = torch.zeros(max(self._audio_dim, 1), dtype=torch.float32)
+            item["has_audio_features"] = sample["has_audio_features"]
+
+        return item
 
     # -- Convenience ----------------------------------------------------------
 
@@ -311,15 +331,17 @@ class EarningsCallDataset(Dataset):
 
 def _collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Custom collate that keeps text as a list of strings."""
-    return {
+    out = {
         "text": [item["text"] for item in batch],
-        "audio_features": torch.stack([item["audio_features"] for item in batch]),
         "label": torch.stack([item["label"] for item in batch]),
         "ticker": [item["ticker"] for item in batch],
         "date": [item["date"] for item in batch],
         "has_transcript": [item["has_transcript"] for item in batch],
-        "has_audio_features": [item["has_audio_features"] for item in batch],
     }
+    if "audio_features" in batch[0]:
+        out["audio_features"] = torch.stack([item["audio_features"] for item in batch])
+        out["has_audio_features"] = [item["has_audio_features"] for item in batch]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -333,19 +355,29 @@ def get_dataloaders(
     test_split: float = 0.15,
     seed: int = 42,
     num_workers: int = 0,
+    split: str = "temporal",
+    val_start: str = "2024-01-01",
+    test_start: str = "2025-01-01",
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    """Create stratified train / val / test DataLoaders.
+    """Create train / val / test DataLoaders.
 
     Parameters
     ----------
     dataset : EarningsCallDataset
     batch_size : int
     val_split : float
-        Fraction of data for validation.
+        Fraction of data for validation (``split="random"`` only).
     test_split : float
-        Fraction of data for test.
+        Fraction of data for test (``split="random"`` only).
     seed : int
     num_workers : int
+    split : {"temporal", "random"}
+        ``"temporal"`` (default): by announcement date — train before
+        *val_start*, val in [*val_start*, *test_start*), test from
+        *test_start* on.  ``"random"``: stratified random split, which lets a
+        company's later quarters train a model tested on its earlier ones.
+    val_start, test_start : str
+        ``YYYY-MM-DD`` cut-offs for the temporal split.
 
     Returns
     -------
@@ -354,32 +386,55 @@ def get_dataloaders(
     n = len(dataset)
     labels = dataset.get_labels()
 
-    # Stratified split via sklearn-style logic (no sklearn dependency)
-    rng = np.random.RandomState(seed)
-    indices = np.arange(n)
+    if split == "temporal":
+        if not val_start < test_start:
+            raise ValueError(f"val_start ({val_start}) must be before test_start ({test_start})")
+        train_idx, val_idx, test_idx = [], [], []
+        for i, s in enumerate(dataset.samples):
+            d = s["date"][:10]
+            if d < val_start:
+                train_idx.append(i)
+            elif d < test_start:
+                val_idx.append(i)
+            else:
+                test_idx.append(i)
+    elif split == "random":
+        # Stratified split via sklearn-style logic (no sklearn dependency)
+        rng = np.random.RandomState(seed)
+        indices = np.arange(n)
 
-    # Separate by class, shuffle within each, then interleave
-    class_indices: Dict[int, np.ndarray] = {}
-    for cls in np.unique(labels):
-        cls_idx = indices[labels == cls]
-        rng.shuffle(cls_idx)
-        class_indices[cls] = cls_idx
+        # Separate by class, shuffle within each, then interleave
+        class_indices: Dict[int, np.ndarray] = {}
+        for cls in np.unique(labels):
+            cls_idx = indices[labels == cls]
+            rng.shuffle(cls_idx)
+            class_indices[cls] = cls_idx
 
-    train_idx, val_idx, test_idx = [], [], []
-    for cls, cls_idx in class_indices.items():
-        nc = len(cls_idx)
-        n_test = max(1, int(nc * test_split))
-        n_val = max(1, int(nc * val_split))
+        train_idx, val_idx, test_idx = [], [], []
+        for cls, cls_idx in class_indices.items():
+            nc = len(cls_idx)
+            n_test = max(1, int(nc * test_split))
+            n_val = max(1, int(nc * val_split))
 
-        test_idx.extend(cls_idx[:n_test])
-        val_idx.extend(cls_idx[n_test : n_test + n_val])
-        train_idx.extend(cls_idx[n_test + n_val :])
+            test_idx.extend(cls_idx[:n_test])
+            val_idx.extend(cls_idx[n_test : n_test + n_val])
+            train_idx.extend(cls_idx[n_test + n_val :])
+    else:
+        raise ValueError(f"Unknown split '{split}' (expected 'temporal' or 'random')")
+
+    for name, idx in (("train", train_idx), ("val", val_idx), ("test", test_idx)):
+        if not idx:
+            raise ValueError(f"{split} split produced an empty {name} set")
 
     train_set = Subset(dataset, train_idx)
     val_set = Subset(dataset, val_idx)
     test_set = Subset(dataset, test_idx)
 
-    print(f"Split sizes — train: {len(train_set)}, val: {len(val_set)}, test: {len(test_set)}")
+    print(
+        f"Split ({split}) — train: {len(train_set)} ({int(labels[train_idx].sum())} miss), "
+        f"val: {len(val_set)} ({int(labels[val_idx].sum())} miss), "
+        f"test: {len(test_set)} ({int(labels[test_idx].sum())} miss)"
+    )
 
     train_loader = DataLoader(
         train_set,
@@ -419,18 +474,21 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Sanity-check the EarningsCallDataset")
     parser.add_argument("--data-root", type=str, default=".", help="Project root directory")
     parser.add_argument("--batch-size", type=int, default=4, help="Batch size for test loader")
+    parser.add_argument("--use-audio", action="store_true", help="Also load audio features (off by default)")
     args = parser.parse_args()
 
-    ds = EarningsCallDataset(data_root=args.data_root)
+    ds = EarningsCallDataset(data_root=args.data_root, use_audio=args.use_audio)
     print(f"\nClass weights: {ds.get_class_weights()}")
-    mean, std = ds.get_feature_stats()
-    print(f"Audio feature mean: {mean[:5]}...  std: {std[:5]}...")
+    if args.use_audio:
+        mean, std = ds.get_feature_stats()
+        print(f"Audio feature mean: {mean[:5]}...  std: {std[:5]}...")
 
     if len(ds) > 0:
         train_dl, val_dl, test_dl = get_dataloaders(ds, batch_size=args.batch_size)
         batch = next(iter(train_dl))
         print(f"\nSample batch keys: {list(batch.keys())}")
-        print(f"  audio_features shape: {batch['audio_features'].shape}")
+        if args.use_audio:
+            print(f"  audio_features shape: {batch['audio_features'].shape}")
         print(f"  labels: {batch['label']}")
         print(f"  tickers: {batch['ticker']}")
         print(f"  text[0][:100]: {batch['text'][0][:100]}...")
