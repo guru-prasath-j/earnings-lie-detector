@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+data/raw/
+data/processed/
+*.wav
+*.mp3
+*.pt
+*.bin
+wandb/
+.env
