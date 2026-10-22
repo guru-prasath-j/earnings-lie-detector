@@ -72,10 +72,12 @@ AUC 0.646 — optimistic.)
 2. Try partial (`--freeze-n-layers 8`) and full fine-tune (`--lr 2e-5 --epochs 15`) once full-text input works.
 3. Check whether TF-IDF signal is just company identity (add per-company feature / company-held-out eval).
 4. More/better text: only 661 samples. 8-K earnings press releases (Ex. 99.1) or call transcripts.
-5. No git remote yet — push to GitHub so other machines get the code and this file.
 
 ## Reference
 
+- Repo: https://github.com/guru-prasath-j/earnings-lie-detector (branch `master`). On the Linux box
+  (Meril1) this repo pushes with a repo-local credential helper reading `~/personal/.secrets/github.env`
+  (account guru-prasath-j); the global `~/.git-credentials` login (guruprasath37) can't push here.
 - Full project plan: https://claude.ai/artifact/9sTZ183A6ZcowvVVU6n6fX
 
 ## Log
@@ -87,3 +89,4 @@ AUC 0.646 — optimistic.)
 - **2026-10-22** — Temporal split (default) in `get_dataloaders`; `train.py` multi-seed with summary.json and
   train-only class weights; added `baselines.py`. Results table above: FinBERT at chance on temporal split,
   history-only best (AUC 0.714). Wrote `docs/` (overview + 6 component docs).
+- **2026-10-22** — Pushed to GitHub (guru-prasath-j/earnings-lie-detector, `master`).
