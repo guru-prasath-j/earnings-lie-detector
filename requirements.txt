@@ -23,6 +23,7 @@ psycopg2-binary
 alembic
 beautifulsoup4
 requests
+yfinance
 docker
 pytest
 httpx
