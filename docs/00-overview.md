@@ -44,6 +44,7 @@ MD&A and predicts **miss (1)** vs **met/beat (0)** for the company's next earnin
 | 3. Join text + labels, split | `src/data/dataset.py` | [03-dataset.md](03-dataset.md) |
 | 4. Neural model + training | `src/models/model.py`, `train.py` | [04-model-and-training.md](04-model-and-training.md) |
 | 5. Measuring and comparing | `src/models/baselines.py` | [05-evaluation-and-baselines.md](05-evaluation-and-baselines.md) |
+| 6. Text features (embeddings, change scores) | `src/models/text_features.py` | [07-text-features.md](07-text-features.md) |
 | (optional) Audio | `src/data/audio_*.py` | [06-audio-pipeline.md](06-audio-pipeline.md) |
 
 ## Three ideas that matter most
@@ -64,27 +65,30 @@ MD&A and predicts **miss (1)** vs **met/beat (0)** for the company's next earnin
 
 Test set: 169 announcements in 2025–2026, 23 of them misses. AUC 0.5 = coin flip, 1.0 = perfect.
 
-| Model | Test AUC | Test F1 | Misses caught |
+| Model | Val AUC | Test AUC | Test F1 |
 |---|---|---|---|
-| FinBERT, first 512 tokens, encoder frozen (5 seeds) | 0.515 ± 0.03 | 0.12 | ~2 / 23 |
-| TF-IDF + logistic regression, full text | 0.672 | 0.23 | 5 / 23 |
-| Company's past surprises only (no text) | 0.714 | 0.40 | 11 / 23 |
-| Past surprises + TF-IDF | 0.724 | 0.40 | 11 / 23 |
+| FinBERT, first 512 tokens, encoder frozen (5 seeds) | 0.59 | 0.515 ± 0.03 | 0.12 |
+| Change-from-last-quarter scores only | 0.51 | 0.518 | 0.21 |
+| TF-IDF, full text | 0.65 | 0.672 | 0.23 |
+| MiniLM embedding of the full text | 0.65 | 0.703 | 0.31 |
+| Company's past surprises only (no text) | 0.73 | 0.728 | 0.39 |
+| **Past surprises + embedding (PCA-16)** — best | **0.75** | **0.752** | 0.35 |
 
 **What this tells us**
 
-- The filing text **does** carry signal (TF-IDF 0.67 ≫ 0.5).
-- FinBERT as currently set up throws it away: it only reads the first 512 tokens (~3% of an MD&A,
-  mostly boilerplate), and with a frozen encoder it can't adapt.
-- A company's own track record is the strongest predictor so far; text isn't yet adding much on top.
+- The filing text **does** carry signal, but only when the model reads the whole thing: a frozen
+  embedding of the full text (0.70) beats FinBERT on the first 512 tokens (0.52).
+- A company's own track record is the strongest single predictor.
+- Text + history together is the best so far (+0.02 AUC on both validation and test) — promising,
+  but within the noise of a 23-miss test set. → [07-text-features.md](07-text-features.md)
+- "Did they rewrite the report?" scores showed no signal for next-quarter EPS.
 
 ## What's next
 
-1. Let the neural model read the whole filing (split into chunks, combine chunk scores), and try
-   fine-tuning the encoder instead of freezing it.
-2. Always compare against the history-only baseline — the text model must beat 0.714 to be useful.
-3. Better text sources (earnings press releases, call transcripts) where management talks about the
+1. Make the gain solid: rolling evaluation over several test years, and more labelled data.
+2. Better text sources (earnings press releases, call transcripts) where management talks about the
    outlook more directly than in a 10-Q.
+3. Optional: LLM-scored features (hedging, outlook tone, new risks) as another input.
 
 ## Glossary
 

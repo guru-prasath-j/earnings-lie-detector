@@ -30,14 +30,18 @@ fancy one is actually adding anything.
 python src/models/baselines.py --data-root .
 ```
 
-Same 661 samples and the same temporal split as `train.py`. All three use logistic regression with
-`class_weight="balanced"`; the regularisation strength `C` is chosen by validation AUC.
+Same 661 samples and the same temporal split as `train.py`. Every model is logistic regression with
+`class_weight="balanced"`; the regularisation strength `C` (0.001–10) is chosen by validation AUC.
+Each test AUC comes with a **95% bootstrap range** (resample the test set 2,000 times).
 
-| Baseline | Features | Question it answers |
+| Feature block | Features | Question it answers |
 |---|---|---|
 | `history` | prior quarter miss and surprise %, 4-quarter miss rate, mean and std of surprise | How far can we get **without any text**? |
 | `tfidf` | TF-IDF of the **full** MD&A (1–2-word phrases, 50k vocab, fit on train only) | Does the text carry signal when nothing is truncated? |
-| `combined` | both | Does text add anything on top of history? |
+| `change`, `embed`, `embed_pca*` | see [07-text-features.md](07-text-features.md) | Which text representation works best? |
+
+Blocks are tested alone and combined (e.g. `history+embed_pca16`), plus an average of separate
+history and embedding models.
 
 - **History features** use only announcements *before* the one being predicted (`shift(1)`), so
   there's no leakage. Data before 2020 (from the labeler) provides history for early samples.
@@ -46,12 +50,16 @@ Same 661 samples and the same temporal split as `train.py`. All three use logist
 
 ## Results (2026-10-22, test = 2025–2026, 169 samples, 23 misses)
 
-| Model | Test AUC | Test F1 | Precision | Recall |
-|---|---|---|---|---|
-| FinBERT frozen, 512 tokens (5 seeds) | 0.515 ± 0.03 | 0.12 ± 0.05 | 0.25 | 0.08 |
-| TF-IDF full text | 0.672 | 0.227 | 0.24 | 0.22 |
-| History only | 0.714 | 0.400 | 0.34 | 0.48 |
-| History + TF-IDF | 0.724 | 0.400 | 0.34 | 0.48 |
+| Model | Val AUC | Test AUC [95% range] | Test F1 | Precision | Recall |
+|---|---|---|---|---|---|
+| FinBERT frozen, 512 tokens (5 seeds) | 0.59 | 0.515 ± 0.03 | 0.12 | 0.25 | 0.08 |
+| TF-IDF full text | 0.652 | 0.672 [0.55–0.78] | 0.227 | 0.24 | 0.22 |
+| Embedding full text | 0.645 | 0.703 [0.58–0.82] | 0.312 | 0.24 | 0.43 |
+| History only | 0.734 | 0.728 [0.61–0.83] | 0.386 | 0.32 | 0.48 |
+| History + TF-IDF | 0.739 | 0.739 [0.63–0.83] | 0.386 | 0.32 | 0.48 |
+| **History + embedding PCA-16** | **0.752** | **0.752** [0.64–0.85] | 0.351 | 0.29 | 0.43 |
+
+(History-only moved from 0.714 to 0.728 when `C=0.001` was added to the search grid.)
 
 Earlier, on a random split, the same FinBERT setup scored test AUC 0.65 — the drop to 0.52 on the
 time-based split shows how much a random split flattered it.
@@ -60,7 +68,7 @@ time-based split shows how much a random split flattered it.
 
 - **Earnings surprises are persistent**: companies that beat tend to keep beating (analysts set
   beatable estimates for some firms). History alone is a strong baseline; any text model must beat
-  **AUC ≈ 0.71** to matter.
+  **AUC ≈ 0.73** to matter.
 - **The text has real signal** (0.67), but part of it may just be identifying *which company* it is
   (names, product terms), which overlaps with history. A useful test: does text still help after
   adding a per-company feature?

@@ -3,13 +3,17 @@
 Reference models for the beat/miss task, evaluated on the same samples and
 temporal split as ``train.py``.
 
-  history  — logistic regression on the company's own past earnings surprises
-             (prior quarter's miss/surprise, last-4-quarter averages).  No text.
-  tfidf    — TF-IDF over the *full* MD&A text (no 512-token cut) + logistic regression.
-  combined — both feature sets together.
+Feature blocks (see ``text_features.py``), each fed to logistic regression alone
+and in combination:
 
-If FinBERT can't beat ``history``, the text adds nothing yet; if ``tfidf``
-beats FinBERT, truncation is discarding useful text.
+  history — the company's own past earnings surprises (prior quarter's
+            miss/surprise, last-4-quarter averages).  No text.
+  change  — how much the filing differs from the company's previous and
+            year-ago filings, plus negative/uncertainty word rates.
+  embed   — mean MiniLM embedding over the *whole* MD&A (384-dim).
+  tfidf   — TF-IDF over the full MD&A text.
+
+Any text block must improve on ``history`` alone to be worth keeping.
 
 Usage:
     python src/models/baselines.py --data-root .
@@ -24,18 +28,21 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix, hstack
+from sklearn.decomposition import PCA
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import confusion_matrix, f1_score, precision_score, recall_score, roc_auc_score
 from sklearn.preprocessing import StandardScaler
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "data"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from dataset import EarningsCallDataset  # noqa: E402
+from text_features import CHANGE_COLS, change_features, document_embeddings  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("baselines")
@@ -76,16 +83,45 @@ def metrics(y: np.ndarray, prob: np.ndarray) -> Dict[str, float]:
     }
 
 
-def fit_eval(X_tr, y_tr, X_va, y_va, X_te, y_te, Cs=(0.01, 0.1, 1.0, 10.0)) -> Dict:
-    """Pick C by validation AUC, report val + test metrics for that C."""
+def auc_ci(y: np.ndarray, prob: np.ndarray, n_boot: int = 2000, seed: int = 0) -> List[float]:
+    """95% bootstrap interval for AUC — how much the score could move by chance."""
+    rng = np.random.default_rng(seed)
+    aucs = []
+    for _ in range(n_boot):
+        i = rng.integers(0, len(y), len(y))
+        if y[i].min() != y[i].max():
+            aucs.append(roc_auc_score(y[i], prob[i]))
+    return [float(v) for v in np.percentile(aucs, [2.5, 97.5])]
+
+
+def fit_eval(X_tr, y_tr, X_va, y_va, X_te, y_te, Cs=(0.001, 0.01, 0.1, 1.0, 10.0)) -> Dict:
+    """Pick C by validation AUC, report val + test metrics for that C.
+
+    Also returns the val/test probabilities (``_prob``) so models can be averaged.
+    """
     best = None
     for C in Cs:
         clf = LogisticRegression(C=C, class_weight="balanced", max_iter=5000)
         clf.fit(X_tr, y_tr)
-        val = metrics(y_va, clf.predict_proba(X_va)[:, 1])
+        p_va, p_te = clf.predict_proba(X_va)[:, 1], clf.predict_proba(X_te)[:, 1]
+        val = metrics(y_va, p_va)
         if best is None or val["auc"] > best["val"]["auc"]:
-            best = {"C": C, "val": val, "test": metrics(y_te, clf.predict_proba(X_te)[:, 1])}
+            best = {"C": C, "val": val, "test": metrics(y_te, p_te), "_prob": {"val": p_va, "test": p_te}}
+    best["test"]["auc_ci95"] = auc_ci(y_te, best["_prob"]["test"])
     return best
+
+
+def average_models(results: Dict, names: Tuple[str, ...], y_va: np.ndarray, y_te: np.ndarray) -> Dict:
+    """Ensemble: average of the probabilities from separately trained models.
+
+    Each block gets its own regularisation, so a 384-dim block can't swamp a 5-dim one.
+    All members are class-balanced logistic regressions, so their probabilities are on
+    the same scale and the usual 0.5 threshold still applies.
+    """
+    prob = {part: np.mean([results[n]["_prob"][part] for n in names], axis=0) for part in ("val", "test")}
+    out = {"C": None, "val": metrics(y_va, prob["val"]), "test": metrics(y_te, prob["test"]), "_prob": prob}
+    out["test"]["auc_ci95"] = auc_ci(y_te, prob["test"])
+    return out
 
 
 def main() -> None:
@@ -100,14 +136,22 @@ def main() -> None:
         ds = EarningsCallDataset(data_root=args.data_root)
     root = Path(args.data_root)
     hist = history_features(root / "data" / "processed" / "labels.csv")
+    change = change_features(ds.transcripts)  # all 664 filings, so "previous filing" is complete
+    used = {s["transcript_key"] for s in ds.samples}
+    emb = document_embeddings({k: ds.transcripts[k] for k in used},
+                              root / "data" / "processed" / "embeddings_minilm.npz")
+    emb_cols = [f"emb_{i}" for i in range(len(next(iter(emb.values()))))]
 
     rows = []
     for s in ds.samples:
+        tk = s["transcript_key"]
         rows.append({
             "date": s["date"][:10],
             "label": s["label"],
-            "text": ds.transcripts[s["transcript_key"]],
+            "text": ds.transcripts[tk],
             **hist.loc[(s["ticker"], s["date"])].to_dict(),
+            **change.loc[tk].to_dict(),
+            **dict(zip(emb_cols, emb[tk])),
         })
     df = pd.DataFrame(rows)
     parts = {
@@ -118,35 +162,52 @@ def main() -> None:
     y = {k: v["label"].to_numpy() for k, v in parts.items()}
     logger.info("Split — " + ", ".join(f"{k}: {len(v)} ({int(v.label.sum())} miss)" for k, v in parts.items()))
 
-    # History features
-    scaler = StandardScaler().fit(parts["train"][HISTORY_COLS])
-    H = {k: scaler.transform(v[HISTORY_COLS]) for k, v in parts.items()}
+    # Dense blocks, each standardised on train only
+    def dense(cols):
+        scaler = StandardScaler().fit(parts["train"][cols])
+        return {k: csr_matrix(scaler.transform(v[cols])) for k, v in parts.items()}
+
+    blocks = {"history": dense(HISTORY_COLS), "change": dense(CHANGE_COLS), "embed": dense(emb_cols)}
+
+    # Embedding compressed to a few components (PCA fit on train) so it can sit next to history
+    for n in (8, 16, 32):
+        pca = PCA(n, random_state=0).fit(blocks["embed"]["train"].toarray())
+        reduced = {k: pca.transform(v.toarray()) for k, v in blocks["embed"].items()}
+        scaler = StandardScaler().fit(reduced["train"])
+        blocks[f"embed_pca{n}"] = {k: csr_matrix(scaler.transform(v)) for k, v in reduced.items()}
 
     # TF-IDF on full text, fit on train only
     tfidf = TfidfVectorizer(max_features=50_000, ngram_range=(1, 2), min_df=3, max_df=0.9,
                             sublinear_tf=True, stop_words="english")
-    T = {"train": tfidf.fit_transform(parts["train"]["text"])}
-    T["val"] = tfidf.transform(parts["val"]["text"])
-    T["test"] = tfidf.transform(parts["test"]["text"])
+    blocks["tfidf"] = {"train": tfidf.fit_transform(parts["train"]["text"])}
+    blocks["tfidf"]["val"] = tfidf.transform(parts["val"]["text"])
+    blocks["tfidf"]["test"] = tfidf.transform(parts["test"]["text"])
 
-    results = {
-        "history": fit_eval(H["train"], y["train"], H["val"], y["val"], H["test"], y["test"]),
-        "tfidf": fit_eval(T["train"], y["train"], T["val"], y["val"], T["test"], y["test"]),
-        "combined": fit_eval(
-            *[m for k in ("train", "val", "test") for m in (hstack([T[k], csr_matrix(H[k])]).tocsr(), y[k])]
-        ),
-    }
+    combos = [
+        ("history",), ("change",), ("embed",), ("tfidf",),
+        ("history", "change"), ("history", "embed"), ("history", "tfidf"),
+        ("history", "change", "embed"),
+        ("history", "embed_pca8"), ("history", "embed_pca16"), ("history", "embed_pca32"),
+    ]
+    results = {}
+    for combo in combos:
+        X = {k: hstack([blocks[b][k] for b in combo]).tocsr() for k in ("train", "val", "test")}
+        results["+".join(combo)] = fit_eval(X["train"], y["train"], X["val"], y["val"], X["test"], y["test"])
+    results["avg(history,embed)"] = average_models(results, ("history", "embed"), y["val"], y["test"])
 
     logger.info("=" * 60)
     for name, r in results.items():
-        logger.info("%-9s C=%-5g VAL f1=%.3f auc=%.3f | TEST f1=%.3f auc=%.3f P=%.3f R=%.3f",
+        lo, hi = r["test"]["auc_ci95"]
+        logger.info("%-22s C=%-5s VAL f1=%.3f auc=%.3f | TEST f1=%.3f auc=%.3f [%.2f–%.2f] P=%.3f R=%.3f",
                     name, r["C"], r["val"]["f1"], r["val"]["auc"],
-                    r["test"]["f1"], r["test"]["auc"], r["test"]["precision"], r["test"]["recall"])
+                    r["test"]["f1"], r["test"]["auc"], lo, hi, r["test"]["precision"], r["test"]["recall"])
 
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w") as f:
-        json.dump({"args": vars(args), "results": results}, f, indent=2)
+        json.dump({"args": vars(args),
+                   "results": {n: {k: v for k, v in r.items() if k != "_prob"} for n, r in results.items()}},
+                  f, indent=2)
     logger.info("Saved %s", out)
 
 

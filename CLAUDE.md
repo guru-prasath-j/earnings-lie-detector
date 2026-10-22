@@ -40,8 +40,9 @@ python src/models/baselines.py --data-root .                                    
 | `src/data/audio_downloader.py`, `audio_features.py` | Optional audio pipeline (Earnings-21/22 HF datasets → ~20–28 librosa features). Not run here; won't join to labels (benchmark calls ≠ our tickers/dates). Downloads ~20–35 GB if run without `--max-calls` |
 | `src/models/model.py` | `EarningsTextClassifier`: `ProsusAI/finbert` (fallback `distilbert-base-uncased`) → [CLS] → Dropout(0.3) → Linear(768→128) → ReLU → Dropout(0.15) → Linear(128→2). `freeze_encoder` / `freeze_n_layers` |
 | `src/models/train.py` | Class-weighted CE (weights from train split), AdamW (head LR = 10× encoder LR), warmup→cosine, AMP on CUDA, early stop on val F1 (patience 3). `--seeds` (default 42–46) → `checkpoints/seed_N/{best_model.pt,training_history.json}` + `checkpoints/summary.json` (mean ± std). `--split temporal|random`, `--val-start`, `--test-start` |
-| `src/models/baselines.py` | Logistic-regression yardsticks on the same samples/split: `history` (prior-quarter miss/surprise, 4q rolling stats, `shift(1)` so no leakage), `tfidf` (full MD&A text), `combined`. C picked by val AUC → `checkpoints/baselines.json` |
-| `docs/` | Learning docs: `00-overview.md` (high-level) + one per component |
+| `src/models/text_features.py` | `change_features` (cosine/Jaccard/length vs previous and ~1-year-earlier filing, neg/uncertainty word rates) and `document_embeddings` (whole MD&A → 256-token chunks → frozen `all-MiniLM-L6-v2` mean-pooled → avg, 384-dim; cached in `data/processed/embeddings_minilm.npz`, ~1.5 min on GPU) |
+| `src/models/baselines.py` | Logistic regression (balanced, C ∈ 0.001–10 picked by val AUC) on feature blocks alone and combined: `history` (prior-quarter miss/surprise, 4q rolling stats, `shift(1)` so no leakage), `change`, `embed`, `embed_pca{8,16,32}` (PCA fit on train), `tfidf`; plus `avg(history,embed)`. Reports 95% bootstrap AUC range → `checkpoints/baselines.json`. ~1 min |
+| `docs/` | Learning docs: `00-overview.md` (high-level) + one per component (`07-text-features.md` = embeddings/change features) |
 | `notebooks/03_eda.ipynb` | EDA (label distribution, feature tests, correlations, temporal) |
 
 ## Key decisions
@@ -55,23 +56,28 @@ python src/models/baselines.py --data-root .                                    
 
 Temporal split, test = 2025–2026 (169 samples, 23 misses), 2026-10-22:
 
-| Model | Test AUC | Test F1 |
-|---|---|---|
-| FinBERT frozen, 512 tokens (5 seeds) | 0.515 ± 0.029 | 0.119 ± 0.051 |
-| TF-IDF full text (LR, C=10) | 0.672 | 0.227 |
-| History only (LR, C=0.01) | **0.714** | **0.400** |
-| History + TF-IDF | 0.724 | 0.400 |
+| Model | Val AUC | Test AUC [95% bootstrap] | Test F1 |
+|---|---|---|---|
+| FinBERT frozen, 512 tokens (5 seeds) | 0.59 | 0.515 ± 0.029 | 0.119 |
+| change features only | 0.508 | 0.518 [0.37–0.66] | 0.208 |
+| TF-IDF full text | 0.652 | 0.672 [0.55–0.78] | 0.227 |
+| MiniLM embedding full text | 0.645 | 0.703 [0.58–0.82] | 0.312 |
+| History only (C=0.001) | 0.734 | 0.728 [0.61–0.83] | 0.386 |
+| **History + embed PCA-16** (best by val) | **0.752** | **0.752** [0.64–0.85] | 0.351 |
+| avg(history, embed) prob ensemble | 0.660 | 0.718 | 0.328 |
 
-Takeaways: text has signal (TF-IDF ≫ 0.5) but FinBERT-512-frozen discards it; company history is the
-strongest predictor; text model must beat AUC ≈ 0.71 to matter. (Random split had shown FinBERT test
-AUC 0.646 — optimistic.)
+Takeaways: architecture direction = frozen text features + small model, not end-to-end FinBERT (too
+little data, 512-token limit). Full-text embedding is the best text representation; combined with
+history it's best overall (+0.02 val & test) but within noise (23 test misses). Change features: no
+signal. Select configs by val AUC, never test. (Random split had shown FinBERT test AUC 0.646 — optimistic.)
 
 ## Open issues / next steps
 
-1. 512-token truncation sees ~3% of the MD&A (mostly boilerplate) — implement chunk/sliding-window pooling over the whole filing; try skipping the opening boilerplate.
-2. Try partial (`--freeze-n-layers 8`) and full fine-tune (`--lr 2e-5 --epochs 15`) once full-text input works.
-3. Check whether TF-IDF signal is just company identity (add per-company feature / company-held-out eval).
-4. More/better text: only 661 samples. 8-K earnings press releases (Ex. 99.1) or call transcripts.
+1. Gains are within noise — add rolling/expanding-window evaluation over multiple test years for tighter estimates.
+2. More/better text: only 661 samples. 8-K earnings press releases (Ex. 99.1) or call transcripts.
+3. Optional LLM-scored features (hedging, outlook tone, new risks, guidance specificity) — needs Anthropic API key, a few $ per run.
+4. Check whether text signal is just company identity (company-held-out eval).
+5. Possible upgrades: stronger embedder (e.g. bge-base), Loughran-McDonald dictionary for tone features, gradient boosting.
 
 ## Reference
 
@@ -90,3 +96,6 @@ AUC 0.646 — optimistic.)
   train-only class weights; added `baselines.py`. Results table above: FinBERT at chance on temporal split,
   history-only best (AUC 0.714). Wrote `docs/` (overview + 6 component docs).
 - **2026-10-22** — Pushed to GitHub (guru-prasath-j/earnings-lie-detector, `master`).
+- **2026-10-22** — Added `text_features.py` (change features + full-text MiniLM embeddings), extended
+  `baselines.py` (PCA blocks, prob-average ensemble, bootstrap CIs, C grid incl. 0.001). Best: history +
+  embed PCA-16, val/test AUC 0.752 vs history 0.734/0.728. Change features no signal. Added `docs/07-text-features.md`.
