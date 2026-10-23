@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 from typing import Dict, List, Optional, Sequence
 
+import numpy as np
 import torch
 import torch.nn as nn
 from peft import LoraConfig, get_peft_model
@@ -37,7 +38,12 @@ class EarningsTextClassifier(nn.Module):
     model_names : sequence of str
         Hugging Face model ids to try in order; the first that loads is used.
     max_length : int
-        Token limit per document (MD&A text beyond this is truncated).
+        Tokens per chunk (the encoder's input limit).
+    max_chunks : int
+        1 (default): read only the first ``max_length`` tokens of each document.
+        > 1: split the whole document into ``max_length``-token chunks, keep up
+        to ``max_chunks`` of them evenly spaced from start to end, encode each,
+        and mean-pool the chunk [CLS] vectors into one document vector.
     freeze_encoder : bool
         Freeze the whole encoder and train only the head.
     freeze_n_layers : int
@@ -55,6 +61,7 @@ class EarningsTextClassifier(nn.Module):
         self,
         model_names: Sequence[str] = DEFAULT_MODELS,
         max_length: int = 512,
+        max_chunks: int = 1,
         hidden_dim: int = 128,
         dropout: float = 0.3,
         head_dropout: float = 0.15,
@@ -67,6 +74,7 @@ class EarningsTextClassifier(nn.Module):
     ) -> None:
         super().__init__()
         self.max_length = max_length
+        self.max_chunks = max_chunks
 
         last_exc: Optional[Exception] = None
         for name in model_names:
@@ -128,19 +136,45 @@ class EarningsTextClassifier(nn.Module):
         logger.info("Froze embeddings + %d/%d encoder layers", min(n, len(layers)), len(layers))
 
     def tokenize(self, texts: List[str], device: torch.device) -> dict:
-        batch = self.tokenizer(
-            texts,
-            truncation=True,
-            padding=True,
-            max_length=self.max_length,
-            return_tensors="pt",
-        )
-        return {k: v.to(device) for k, v in batch.items()}
+        """Tokenise a batch of documents into chunk rows.
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, **_: torch.Tensor) -> torch.Tensor:
+        Returns ``input_ids`` / ``attention_mask`` of shape (total_chunks, L) and
+        ``doc_ids`` (total_chunks,) saying which document each chunk belongs to.
+        """
+        if self.max_chunks == 1:
+            batch = self.tokenizer(texts, truncation=True, padding=True,
+                                   max_length=self.max_length, return_tensors="pt")
+            doc_ids = torch.arange(len(texts))
+        else:
+            # Cut every document into consecutive max_length-token chunks
+            batch = self.tokenizer(texts, truncation=True, padding=True, max_length=self.max_length,
+                                   return_overflowing_tokens=True, return_tensors="pt")
+            chunk_doc = batch.pop("overflow_to_sample_mapping")  # chunk row -> document index
+            # Keep at most max_chunks per document, evenly spaced from start to end
+            keep = []
+            for d in range(len(texts)):
+                rows = (chunk_doc == d).nonzero().flatten()
+                if len(rows) > self.max_chunks:
+                    rows = rows[np.unique(np.linspace(0, len(rows) - 1, self.max_chunks).round().astype(int))]
+                keep.append(rows)
+            keep = torch.cat(keep)
+            batch = {k: v[keep] for k, v in batch.items()}
+            doc_ids = chunk_doc[keep]
+        return {"input_ids": batch["input_ids"].to(device),
+                "attention_mask": batch["attention_mask"].to(device),
+                "doc_ids": doc_ids.to(device)}
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor,
+                doc_ids: Optional[torch.Tensor] = None, **_: torch.Tensor) -> torch.Tensor:
         out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        cls = out.last_hidden_state[:, 0]  # [CLS] pooling
-        return self.head(cls)
+        cls = out.last_hidden_state[:, 0]  # one [CLS] vector per chunk
+        if doc_ids is None:
+            doc_ids = torch.arange(len(cls), device=cls.device)
+        # Mean-pool chunk vectors per document: sum them by doc id, divide by chunk count
+        n_docs = int(doc_ids.max()) + 1
+        summed = torch.zeros(n_docs, cls.shape[1], dtype=cls.dtype, device=cls.device).index_add_(0, doc_ids, cls)
+        counts = torch.bincount(doc_ids, minlength=n_docs).clamp(min=1).unsqueeze(1).to(cls.dtype)
+        return self.head(summed / counts)
 
     def encoder_parameters(self):
         return [p for p in self.encoder.parameters() if p.requires_grad]

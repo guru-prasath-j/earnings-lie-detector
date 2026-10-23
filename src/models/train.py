@@ -7,6 +7,9 @@ Usage:
     python src/models/train.py --data-root . --epochs 15 --batch-size 8 --lr 2e-5
     python src/models/train.py --data-root . --freeze-n-layers 8 --epochs 15
     python src/models/train.py --data-root . --lora-r 8 --lr 2e-4 --head-lr 2e-4 --epochs 10
+    # whole filing: 16 evenly spaced chunks, 1 doc per batch, update every 8 docs
+    python src/models/train.py --data-root . --lora-r 8 --lr 2e-4 --head-lr 2e-4 \\
+        --max-chunks 16 --batch-size 1 --grad-accum 8 --seeds 42 43 44
 """
 
 from __future__ import annotations
@@ -53,7 +56,7 @@ def evaluate(model, loader, criterion, device) -> Dict[str, float]:
         inputs = model.tokenize(batch["text"], device)
         y = batch["label"].to(device)
         logits = model(**inputs)
-        losses.append(criterion(logits, y).item() * len(y))
+        losses.append(criterion(logits, y).item())  # criterion sums over the batch
         probs.extend(torch.softmax(logits, dim=-1)[:, 1].cpu().tolist())
         labels.extend(y.cpu().tolist())
 
@@ -86,6 +89,7 @@ def train_one(args, ds: EarningsCallDataset, seed: int, out_dir: Path, device: t
 
     model = EarningsTextClassifier(
         max_length=args.max_length,
+        max_chunks=args.max_chunks,
         freeze_encoder=args.freeze_encoder,
         freeze_n_layers=args.freeze_n_layers,
         lora_r=args.lora_r,
@@ -98,7 +102,11 @@ def train_one(args, ds: EarningsCallDataset, seed: int, out_dir: Path, device: t
     counts = np.bincount(train_labels, minlength=2).astype(np.float64)
     class_weights = torch.tensor(len(train_labels) / (2 * counts + 1e-8), dtype=torch.float32).to(device)
     logger.info("Class weights (train split): %s", class_weights.tolist())
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    # reduction="sum", then divide by a FIXED batch size below.  The default "mean"
+    # divides by the sum of the batch's class weights, which cancels the weight
+    # entirely when a batch holds a single document (as with gradient accumulation).
+    criterion = nn.CrossEntropyLoss(weight=class_weights, reduction="sum")
+    effective_batch = args.batch_size * args.grad_accum
 
     head_lr = args.head_lr if args.head_lr is not None else args.lr * 10
     param_groups = [{"params": model.head_parameters(), "lr": head_lr}]
@@ -107,7 +115,7 @@ def train_one(args, ds: EarningsCallDataset, seed: int, out_dir: Path, device: t
         param_groups.append({"params": enc_params, "lr": args.lr})
     optimizer = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
 
-    total_steps = args.epochs * len(train_dl)
+    total_steps = args.epochs * math.ceil(len(train_dl) / args.grad_accum)  # optimizer steps, not batches
     scheduler = warmup_cosine(optimizer, int(args.warmup_ratio * total_steps), total_steps)
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -120,19 +128,23 @@ def train_one(args, ds: EarningsCallDataset, seed: int, out_dir: Path, device: t
     for epoch in range(1, args.epochs + 1):
         model.train()
         t0, running = time.time(), 0.0
-        for batch in train_dl:
+        optimizer.zero_grad()
+        for i, batch in enumerate(train_dl, start=1):
             inputs = model.tokenize(batch["text"], device)
             y = batch["label"].to(device)
-            optimizer.zero_grad()
             with torch.autocast(device_type=device.type, enabled=use_amp):
-                loss = criterion(model(**inputs), y)
+                loss = criterion(model(**inputs), y) / effective_batch
+            # .backward() ADDS this batch's gradients to each parameter's .grad
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
-            running += loss.item() * len(y)
+            running += loss.item() * effective_batch
+            # Update weights only every grad_accum batches (and on the last batch)
+            if i % args.grad_accum == 0 or i == len(train_dl):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad()
 
         train_loss = running / len(train_dl.dataset)
         val = evaluate(model, val_dl, criterion, device)
@@ -190,7 +202,11 @@ def main() -> None:
     p.add_argument("--lora-dropout", type=float, default=0.1)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--warmup-ratio", type=float, default=0.1)
-    p.add_argument("--max-length", type=int, default=512)
+    p.add_argument("--max-length", type=int, default=512, help="Tokens per chunk")
+    p.add_argument("--max-chunks", type=int, default=1,
+                   help="1 = first max-length tokens only; >1 = up to N evenly spaced chunks, mean-pooled")
+    p.add_argument("--grad-accum", type=int, default=1,
+                   help="Batches per optimizer step (effective batch = batch-size x grad-accum)")
     p.add_argument("--freeze-encoder", action="store_true")
     p.add_argument("--freeze-n-layers", type=int, default=0)
     p.add_argument("--patience", type=int, default=3, help="Early-stopping patience on val F1")

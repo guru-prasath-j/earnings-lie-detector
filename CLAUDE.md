@@ -38,8 +38,8 @@ python src/models/baselines.py --data-root .                                    
 | `src/data/labeler.py` | Default `--method direct`: yfinance `get_earnings_dates` (history back to ~2014, `lookback_quarters=40`) → one row per earnings announcement; `label = 1 if eps_actual < eps_estimate`. `date` = announcement date. Reads both `{T}.json` and `{T}/*.json` layouts, skips `_*` files |
 | `src/data/dataset.py` | `EarningsCallDataset`. Pairs each label (announcement date) with the latest filing **strictly before** it within 120 days (`max_transcript_gap_days`). `use_audio=False` by default → text-only, drops labels with no filing, batches have no audio keys. `get_dataloaders(split="temporal")` default: train < 2024-01-01 (370, 48 miss), val 2024 (122, 21), test ≥ 2025-01-01 (169, 23); `split="random"` still available |
 | `src/data/audio_downloader.py`, `audio_features.py` | Optional audio pipeline (Earnings-21/22 HF datasets → ~20–28 librosa features). Not run here; won't join to labels (benchmark calls ≠ our tickers/dates). Downloads ~20–35 GB if run without `--max-calls` |
-| `src/models/model.py` | `EarningsTextClassifier`: `ProsusAI/finbert` (fallback `distilbert-base-uncased`) → [CLS] → Dropout(0.3) → Linear(768→128) → ReLU → Dropout(0.15) → Linear(128→2). `freeze_encoder` / `freeze_n_layers` / LoRA (`lora_r>0`: peft adapters on query+value, r=8 → 393,602 trainable = 0.36%) |
-| `src/models/train.py` | Class-weighted CE (weights from train split), AdamW (head LR = 10× encoder LR), warmup→cosine, AMP on CUDA, early stop on val F1 (patience 3). `--seeds` (default 42–46) → `checkpoints/seed_N/{best_model.pt,training_history.json}` + `checkpoints/summary.json` (mean ± std). `--split temporal|random`, `--val-start`, `--test-start`, `--lora-r/--lora-alpha/--lora-dropout`, `--head-lr`. Checkpoints hold trainable weights only (~1.6 MB) |
+| `src/models/model.py` | `EarningsTextClassifier`: `ProsusAI/finbert` (fallback `distilbert-base-uncased`) → [CLS] → Dropout(0.3) → Linear(768→128) → ReLU → Dropout(0.15) → Linear(128→2). `freeze_encoder` / `freeze_n_layers` / LoRA (`lora_r>0`: peft adapters on query+value, r=8 → 393,602 trainable = 0.36%). `max_chunks>1`: whole filing → 512-token chunks, up to N evenly spaced, [CLS] mean-pooled per doc (`doc_ids`) |
+| `src/models/train.py` | Class-weighted CE (weights from train split), AdamW (head LR = 10× encoder LR), warmup→cosine, AMP on CUDA, early stop on val F1 (patience 3). `--seeds` (default 42–46) → `checkpoints/seed_N/{best_model.pt,training_history.json}` + `checkpoints/summary.json` (mean ± std). `--split temporal|random`, `--val-start`, `--test-start`, `--lora-r/--lora-alpha/--lora-dropout`, `--head-lr`, `--max-chunks`, `--grad-accum` (loss uses `reduction="sum"` / fixed effective batch so class weights survive batch-size 1). Checkpoints hold trainable weights only (~1.6 MB) |
 | `src/models/text_features.py` | `change_features` (cosine/Jaccard/length vs previous and ~1-year-earlier filing, neg/uncertainty word rates) and `document_embeddings` (whole MD&A → 256-token chunks → frozen `all-MiniLM-L6-v2` mean-pooled → avg, 384-dim; cached in `data/processed/embeddings_minilm.npz`, ~1.5 min on GPU) |
 | `src/models/baselines.py` | Logistic regression (balanced, C ∈ 0.001–10 picked by val AUC) on feature blocks alone and combined: `history` (prior-quarter miss/surprise, 4q rolling stats, `shift(1)` so no leakage), `change`, `embed`, `embed_pca{8,16,32}` (PCA fit on train), `tfidf`; plus `avg(history,embed)`. Reports 95% bootstrap AUC range → `checkpoints/baselines.json`. ~1 min |
 | `docs/` | Learning docs: `00-overview.md` (high-level) + one per component (`07-text-features.md` = embeddings/change features) |
@@ -60,6 +60,8 @@ Temporal split, test = 2025–2026 (169 samples, 23 misses), 2026-10-22:
 |---|---|---|---|
 | FinBERT frozen, 512 tokens (5 seeds) | 0.59 | 0.515 ± 0.029 | 0.119 |
 | FinBERT + LoRA r=8, 512 tokens (5 seeds) | 0.598 ± 0.034 | 0.525 ± 0.029 | 0.170 |
+| FinBERT frozen, 16 chunks mean-pooled (3 seeds) | 0.667 ± 0.003 | 0.603 ± 0.011 | 0.065 |
+| FinBERT + LoRA r=8, 16 chunks (3 seeds) | 0.639 ± 0.004 | 0.611 ± 0.020 | 0.116 |
 | change features only | 0.508 | 0.518 [0.37–0.66] | 0.208 |
 | TF-IDF full text | 0.652 | 0.672 [0.55–0.78] | 0.227 |
 | MiniLM embedding full text | 0.645 | 0.703 [0.58–0.82] | 0.312 |
@@ -74,7 +76,7 @@ signal. Select configs by val AUC, never test. (Random split had shown FinBERT t
 
 ## Open issues / next steps
 
-0. Day-2 learning plan in progress (user wants concept → code → explanation, one task at a time, wait for "ready"): Task 1 LoRA — part A (512 tokens) done, part B (LoRA + whole-filing chunks) next; then Task 2 fusion model + manual loop, 3 W&B sweeps, 4 evaluation deep dive, 5 push to HF Hub, 6 docs.
+0. Day-2 learning plan in progress (user wants concept → code → explanation, one task at a time, wait for "ready"): Task 1 LoRA done (A: 512 tokens, B: whole-filing chunks); next Task 2 fusion model + manual loop, 3 W&B sweeps, 4 evaluation deep dive, 5 push to HF Hub, 6 docs.
 1. Gains are within noise — add rolling/expanding-window evaluation over multiple test years for tighter estimates.
 2. More/better text: only 661 samples. 8-K earnings press releases (Ex. 99.1) or call transcripts.
 3. Optional LLM-scored features (hedging, outlook tone, new risks, guidance specificity) — needs Anthropic API key, a few $ per run.
@@ -102,3 +104,4 @@ signal. Select configs by val AUC, never test. (Random split had shown FinBERT t
   `baselines.py` (PCA blocks, prob-average ensemble, bootstrap CIs, C grid incl. 0.001). Best: history +
   embed PCA-16, val/test AUC 0.752 vs history 0.734/0.728. Change features no signal. Added `docs/07-text-features.md`.
 - **2026-10-23** — Task 1A: LoRA (peft, r=8, α=16, q/v) in `model.py`; `train.py` `--lora-*`, `--head-lr`, trainable-only checkpoints. LoRA on 512 tokens: test AUC 0.525 ± 0.029 vs frozen 0.515 — no gain; val AUC usually peaks at epoch 1 then falls (overfits boilerplate). Confirms truncation is the bottleneck. Val F1 is a jumpy early-stopping metric (flips 0↔0.35).
+- **2026-10-23** — Task 1B: `max_chunks` whole-filing chunking (mean-pooled [CLS]) in `model.py`; `train.py` `--max-chunks`, `--grad-accum`, sum-reduced loss (mean reduction cancelled class weights at batch 1). 16 chunks lifts FinBERT test AUC 0.515 → 0.603 (frozen) / 0.611 (LoRA) — confirms truncation was the bottleneck, but still below MiniLM full-text LR (0.703); LoRA adds nothing over frozen. Test F1 low (threshold 0.5 too conservative). Runs in `checkpoints/{frozen,lora_r8}_chunks16/`.
