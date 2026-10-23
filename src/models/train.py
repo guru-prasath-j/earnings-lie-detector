@@ -6,6 +6,7 @@ Usage:
     python src/models/train.py --data-root . --freeze-encoder --epochs 10 --batch-size 8
     python src/models/train.py --data-root . --epochs 15 --batch-size 8 --lr 2e-5
     python src/models/train.py --data-root . --freeze-n-layers 8 --epochs 15
+    python src/models/train.py --data-root . --lora-r 8 --lr 2e-4 --head-lr 2e-4 --epochs 10
 """
 
 from __future__ import annotations
@@ -87,6 +88,9 @@ def train_one(args, ds: EarningsCallDataset, seed: int, out_dir: Path, device: t
         max_length=args.max_length,
         freeze_encoder=args.freeze_encoder,
         freeze_n_layers=args.freeze_n_layers,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
     ).to(device)
 
     # Inverse-frequency class weights from the training split only
@@ -96,7 +100,8 @@ def train_one(args, ds: EarningsCallDataset, seed: int, out_dir: Path, device: t
     logger.info("Class weights (train split): %s", class_weights.tolist())
     criterion = nn.CrossEntropyLoss(weight=class_weights)
 
-    param_groups = [{"params": model.head_parameters(), "lr": args.lr * 10}]
+    head_lr = args.head_lr if args.head_lr is not None else args.lr * 10
+    param_groups = [{"params": model.head_parameters(), "lr": head_lr}]
     enc_params = model.encoder_parameters()
     if enc_params:
         param_groups.append({"params": enc_params, "lr": args.lr})
@@ -140,7 +145,10 @@ def train_one(args, ds: EarningsCallDataset, seed: int, out_dir: Path, device: t
 
         if val["f1"] > best_f1:
             best_f1, bad_epochs = val["f1"], 0
-            torch.save({"model_state": model.state_dict(), "model_name": model.model_name,
+            # Save only trainable weights (head + any LoRA adapters); the frozen
+            # encoder is reloaded from the Hub, so this is ~1.5 MB instead of ~440 MB
+            trainable = {n: p.detach().cpu() for n, p in model.named_parameters() if p.requires_grad}
+            torch.save({"model_state": trainable, "model_name": model.model_name,
                         "args": vars(args), "seed": seed, "epoch": epoch, "val": val}, best_path)
             logger.info("  New best val F1 %.3f — saved %s", best_f1, best_path)
         else:
@@ -151,7 +159,11 @@ def train_one(args, ds: EarningsCallDataset, seed: int, out_dir: Path, device: t
 
     # Final test evaluation with the best checkpoint
     ckpt = torch.load(best_path, map_location=device)
-    model.load_state_dict(ckpt["model_state"])
+    # strict=False: the checkpoint holds only trainable weights; frozen ones are already loaded
+    missing_trainable = {n for n, p in model.named_parameters() if p.requires_grad} - set(ckpt["model_state"])
+    unexpected = model.load_state_dict(ckpt["model_state"], strict=False).unexpected_keys
+    if missing_trainable or unexpected:
+        raise RuntimeError(f"Checkpoint mismatch: missing={missing_trainable} unexpected={unexpected}")
     test = evaluate(model, test_dl, criterion, device)
     logger.info(
         "TEST seed %d (best epoch %d): F1=%.3f AUC=%.3f P=%.3f R=%.3f spec=%.3f  [tp=%d fp=%d tn=%d fn=%d]",
@@ -171,7 +183,11 @@ def main() -> None:
     p.add_argument("--output-dir", default="checkpoints")
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=8)
-    p.add_argument("--lr", type=float, default=2e-5, help="Encoder LR (head uses 10x)")
+    p.add_argument("--lr", type=float, default=2e-5, help="Encoder / LoRA-adapter LR")
+    p.add_argument("--head-lr", type=float, default=None, help="Head LR (default: 10x --lr)")
+    p.add_argument("--lora-r", type=int, default=0, help="LoRA rank; 0 disables LoRA")
+    p.add_argument("--lora-alpha", type=float, default=16)
+    p.add_argument("--lora-dropout", type=float, default=0.1)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--warmup-ratio", type=float, default=0.1)
     p.add_argument("--max-length", type=int, default=512)

@@ -3,20 +3,30 @@ Text classifier for the Earnings Call Lie Detector project.
 
 FinBERT encoder → [CLS] pooling → small MLP head → 2 logits (beat=0, miss=1).
 Falls back to ``distilbert-base-uncased`` if FinBERT cannot be loaded.
+
+The encoder can be used frozen, partially/fully fine-tuned, or adapted with
+LoRA (low-rank adapters on the attention query/value projections).
 """
 
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
+from peft import LoraConfig, get_peft_model
 from transformers import AutoModel, AutoTokenizer
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODELS: Sequence[str] = ("ProsusAI/finbert", "distilbert-base-uncased")
+
+# Attention query/value projections are named differently per architecture
+LORA_TARGETS: Dict[str, List[str]] = {
+    "bert": ["query", "value"],
+    "distilbert": ["q_lin", "v_lin"],
+}
 
 
 class EarningsTextClassifier(nn.Module):
@@ -33,6 +43,12 @@ class EarningsTextClassifier(nn.Module):
     freeze_n_layers : int
         Freeze the embeddings and the first *n* transformer layers.
         Ignored when ``freeze_encoder`` is set.
+    lora_r : int
+        LoRA rank.  0 (default) disables LoRA.  When > 0 the encoder is frozen
+        and only the low-rank adapters (plus the head) are trained;
+        ``freeze_encoder`` / ``freeze_n_layers`` are then ignored.
+    lora_alpha, lora_dropout : float
+        LoRA scaling (effective strength ``alpha / r``) and adapter dropout.
     """
 
     def __init__(
@@ -45,6 +61,9 @@ class EarningsTextClassifier(nn.Module):
         num_classes: int = 2,
         freeze_encoder: bool = False,
         freeze_n_layers: int = 0,
+        lora_r: int = 0,
+        lora_alpha: float = 16,
+        lora_dropout: float = 0.1,
     ) -> None:
         super().__init__()
         self.max_length = max_length
@@ -72,11 +91,27 @@ class EarningsTextClassifier(nn.Module):
             nn.Linear(hidden_dim, num_classes),
         )
 
-        if freeze_encoder:
+        if lora_r > 0:
+            if freeze_encoder or freeze_n_layers:
+                logger.warning("LoRA enabled: ignoring freeze_encoder / freeze_n_layers")
+            lora_config = LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                target_modules=LORA_TARGETS[self.encoder.config.model_type],
+                bias="none",
+            )
+            # Freezes every original encoder weight and injects trainable A/B matrices
+            self.encoder = get_peft_model(self.encoder, lora_config)
+        elif freeze_encoder:
             for p in self.encoder.parameters():
                 p.requires_grad = False
         elif freeze_n_layers > 0:
             self._freeze_bottom_layers(freeze_n_layers)
+
+        n_train = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        n_total = sum(p.numel() for p in self.parameters())
+        logger.info("Trainable parameters: %s / %s (%.2f%%)", f"{n_train:,}", f"{n_total:,}", 100 * n_train / n_total)
 
     def _freeze_bottom_layers(self, n: int) -> None:
         """Freeze embeddings + the first *n* transformer blocks."""
