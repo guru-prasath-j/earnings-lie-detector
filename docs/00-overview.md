@@ -46,6 +46,7 @@ MD&A and predicts **miss (1)** vs **met/beat (0)** for the company's next earnin
 | 5. Measuring and comparing | `src/models/baselines.py` | [05-evaluation-and-baselines.md](05-evaluation-and-baselines.md) |
 | 6. Text features (embeddings, change scores) | `src/models/text_features.py` | [07-text-features.md](07-text-features.md) |
 | 7. Fusion model (history + text, hand-written loop) | `src/models/fusion.py` | [08-fusion-model.md](08-fusion-model.md) |
+| 8. Hyperparameter sweep (W&B) | `src/models/sweep.py` | [09-wandb-sweeps.md](09-wandb-sweeps.md) |
 | (optional) Audio | `src/data/audio_*.py` | [06-audio-pipeline.md](06-audio-pipeline.md) |
 
 ## Three ideas that matter most
@@ -85,6 +86,8 @@ Test set: 169 announcements in 2025–2026, 23 of them misses. AUC 0.5 = coin fl
 - "Did they rewrite the report?" scores showed no signal for next-quarter EPS.
 - A small neural fusion network (history branch + text branch) reaches val 0.69 / test 0.73 — not
   better than the logistic regression on val, which is how we choose. → [08-fusion-model.md](08-fusion-model.md)
+- A 50-run W&B sweep tuned it to val 0.73 / test 0.74 — level with logistic regression on history.
+  The sweep's main finding: squeeze the text to 4 features, give history more room. → [09-wandb-sweeps.md](09-wandb-sweeps.md)
 
 ## What's next
 

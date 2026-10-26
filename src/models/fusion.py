@@ -40,7 +40,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -98,8 +98,30 @@ def predict(model: nn.Module, X: Dict[str, torch.Tensor]) -> np.ndarray:
     return torch.sigmoid(model(X)).cpu().numpy()
 
 
+def load_tensors(data_root: str, blocks: List[str], val_start: str, test_start: str, device: torch.device
+                 ) -> Tuple[Dict[str, Dict[str, torch.Tensor]], Dict[str, torch.Tensor]]:
+    """Feature blocks per split, standardised on train only, already on ``device``."""
+    df, emb_cols = build_table(data_root)
+    parts = temporal_split(df, val_start, test_start)
+    cols = {"history": HISTORY_COLS, "embed": emb_cols}
+    X: Dict[str, Dict[str, torch.Tensor]] = {part: {} for part in parts}
+    for b in blocks:
+        scaler = StandardScaler().fit(parts["train"][cols[b]])
+        for part, frame in parts.items():
+            X[part][b] = torch.tensor(scaler.transform(frame[cols[b]]), dtype=torch.float32, device=device)
+    y = {part: torch.tensor(frame["label"].to_numpy(), dtype=torch.float32, device=device)
+         for part, frame in parts.items()}
+    return X, y
+
+
 def train_one(args, X: Dict[str, Dict[str, torch.Tensor]], y: Dict[str, torch.Tensor],
-              seed: int, device: torch.device) -> Dict:
+              seed: int, device: torch.device, eval_test: bool = True,
+              on_epoch: Optional[Callable[[Dict], None]] = None) -> Tuple[Dict, Dict[str, np.ndarray]]:
+    """Train one model; returns (result, probabilities).
+
+    ``eval_test=False`` never touches the test set (used by the sweep).
+    ``on_epoch`` is called with each epoch's record (e.g. to log it to W&B).
+    """
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -139,6 +161,8 @@ def train_one(args, X: Dict[str, Dict[str, torch.Tensor]], y: Dict[str, torch.Te
         p_val = predict(model, X["val"])
         val_auc = roc_auc_score(y["val"].cpu().numpy(), p_val)
         history.append({"epoch": epoch, "train_loss": total / n, "val_auc": float(val_auc)})
+        if on_epoch:
+            on_epoch(history[-1])
 
         # ---- early stopping on val AUC (smooth, threshold-free; val F1 is too jumpy) ----
         if val_auc > best_auc:
@@ -150,18 +174,16 @@ def train_one(args, X: Dict[str, Dict[str, torch.Tensor]], y: Dict[str, torch.Te
                 break
 
     model.load_state_dict(best_state)  # roll back to the best epoch
-    probs = {part: predict(model, X[part]) for part in ("val", "test")}
-    result = {
-        "seed": seed,
-        "best_epoch": best_epoch,
-        "epochs_run": epoch,
-        "val": metrics(y["val"].cpu().numpy(), probs["val"]),
-        "test": metrics(y["test"].cpu().numpy(), probs["test"]),
-        "history": history,
-    }
-    logger.info("seed %d: best epoch %d/%d  VAL auc=%.3f f1=%.3f | TEST auc=%.3f f1=%.3f",
-                seed, best_epoch, epoch, result["val"]["auc"], result["val"]["f1"],
-                result["test"]["auc"], result["test"]["f1"])
+    parts = ("val", "test") if eval_test else ("val",)
+    probs = {part: predict(model, X[part]) for part in parts}
+    result = {"seed": seed, "best_epoch": best_epoch, "epochs_run": epoch, "history": history}
+    for part in parts:
+        result[part] = metrics(y[part].cpu().numpy(), probs[part])
+    msg = "seed %d: best epoch %d/%d  VAL auc=%.3f f1=%.3f" % (
+        seed, best_epoch, epoch, result["val"]["auc"], result["val"]["f1"])
+    if eval_test:
+        msg += " | TEST auc=%.3f f1=%.3f" % (result["test"]["auc"], result["test"]["f1"])
+    logger.info(msg)
     return result, probs
 
 
@@ -191,18 +213,7 @@ def main() -> None:
     out_dir = Path(args.output_dir or f"checkpoints/fusion/{name}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    df, emb_cols = build_table(args.data_root)
-    parts = temporal_split(df, args.val_start, args.test_start)
-    cols = {"history": HISTORY_COLS, "embed": emb_cols}
-
-    # Standardise each block on train only, then move everything to the device once
-    X: Dict[str, Dict[str, torch.Tensor]] = {part: {} for part in parts}
-    for b in args.blocks:
-        scaler = StandardScaler().fit(parts["train"][cols[b]])
-        for part, frame in parts.items():
-            X[part][b] = torch.tensor(scaler.transform(frame[cols[b]]), dtype=torch.float32, device=device)
-    y = {part: torch.tensor(frame["label"].to_numpy(), dtype=torch.float32, device=device)
-         for part, frame in parts.items()}
+    X, y = load_tensors(args.data_root, args.blocks, args.val_start, args.test_start, device)
 
     runs, probs = [], []
     for seed in args.seeds:
