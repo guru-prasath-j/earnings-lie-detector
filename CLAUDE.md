@@ -43,8 +43,9 @@ python src/models/baselines.py --data-root .                                    
 | `src/models/text_features.py` | `change_features` (cosine/Jaccard/length vs previous and ~1-year-earlier filing, neg/uncertainty word rates) and `document_embeddings` (whole MD&A → 256-token chunks → frozen `all-MiniLM-L6-v2` mean-pooled → avg, 384-dim; cached in `data/processed/embeddings_minilm.npz`, ~1.5 min on GPU) |
 | `src/models/fusion.py` | `FusionNet`: history (5) and MiniLM embed (384) blocks; `--fusion late` (per-block Linear+ReLU branches 5→8, 384→16, concat → MLP → 1 logit) or `early` (raw concat → MLP); `--blocks` for single-branch. Hand-written loop (no DataLoader): BCEWithLogits + `pos_weight`, AdamW 1e-3, early stop on val AUC (patience 20), best `state_dict` deepcopy, 5 seeds + seed-ensemble → `checkpoints/fusion/<config>/summary.json`. ~5 s per config |
 | `src/models/sweep.py` | W&B Bayesian sweep over late-fusion lr, weight_decay, branch dims, hidden, dropouts, batch size. Objective = mean val AUC over 3 seeds; never evaluates test. `--best ENTITY/PROJECT/ID` prints the `fusion.py` command for the winner (test once, `checkpoints/fusion/late_swept`). `--dry-run` works without login. Needs `wandb login` |
-| `src/models/baselines.py` | Logistic regression (balanced, C ∈ 0.001–10 picked by val AUC) on feature blocks alone and combined: `history` (prior-quarter miss/surprise, 4q rolling stats, `shift(1)` so no leakage), `change`, `embed`, `embed_pca{8,16,32}` (PCA fit on train), `tfidf`; plus `avg(history,embed)`. Reports 95% bootstrap AUC range → `checkpoints/baselines.json`. ~1 min. `build_table` / `temporal_split` shared with `fusion.py` |
-| `docs/` | Learning docs: `00-overview.md` (high-level) + one per component (`07-text-features.md` = embeddings/change features, `08-fusion-model.md` = fusion + manual loop, `09-wandb-sweeps.md`) |
+| `src/models/evaluate.py` | Deep dive → `checkpoints/evaluation.json`, ~1 min: rolling-origin folds (test 2023 / 2024 / 2025–26, val = preceding year, train = all earlier) for LR history / embed / history+pca16 + swept fusion; pooled AUC + paired-bootstrap ΔAUC vs history; F1 @0.5 vs val-tuned threshold, avg precision, precision in top 10%; company-held-out (GroupKFold by ticker vs random 5-fold) |
+| `src/models/baselines.py` | Logistic regression (balanced, C ∈ 0.001–10 picked by val AUC) on feature blocks alone and combined: `history` (prior-quarter miss/surprise, 4q rolling stats, `shift(1)` so no leakage), `change`, `embed`, `embed_pca{8,16,32}` (PCA fit on train), `tfidf`; plus `avg(history,embed)`. Reports 95% bootstrap AUC range → `checkpoints/baselines.json`. ~1 min. `build_table` (now incl. `ticker`) / `temporal_split` shared with `fusion.py`, `evaluate.py` |
+| `docs/` | Learning docs: `00-overview.md` (high-level) + one per component (`07-text-features.md` = embeddings/change features, `08-fusion-model.md` = fusion + manual loop, `09-wandb-sweeps.md`, `10-evaluation-deep-dive.md`) |
 | `notebooks/03_eda.ipynb` | EDA (label distribution, feature tests, correlations, temporal) |
 
 ## Key decisions
@@ -76,6 +77,12 @@ Temporal split, test = 2025–2026 (169 samples, 23 misses), 2026-10-22:
 | Fusion late (5 seeds; seed-ensemble test 0.784 [0.68–0.87]) | 0.686 ± 0.027 | 0.734 ± 0.019 | 0.337 |
 | Fusion late, W&B-swept (5 seeds; ensemble test 0.745 [0.62–0.84]) | 0.734 ± 0.028 | 0.742 ± 0.032 | 0.361 |
 
+**Rolling-origin pooled (test 2023–26, 403 samples / 58 misses, `evaluate.py`):** history 0.693, embed 0.675,
+history+PCA-16 0.708 (ΔAUC vs history +0.016 [−0.021, +0.053], P(Δ>0)=0.80), swept fusion 0.705. Per-year AUC
+swings ±0.05 and rankings flip. Top-10% watch-list precision ~38–40% vs 14% base. Val-tuned threshold hurts F1
+vs 0.5. **Company-held-out: embed AUC 0.673 → 0.481 (chance)**, history 0.703 → 0.681 — the text embedding
+mostly encodes company identity; no transferable text signal.
+
 Takeaways: architecture direction = frozen text features + small model, not end-to-end FinBERT (too
 little data, 512-token limit). Full-text embedding is the best text representation; combined with
 history it's best overall (+0.02 val & test) but within noise (23 test misses). Change features: no
@@ -83,11 +90,11 @@ signal. Neural late fusion > early fusion on val but < LR history+PCA-16; MLP un
 
 ## Open issues / next steps
 
-0. Day-2 learning plan in progress (user wants concept → code → explanation, one task at a time, wait for "ready"): Task 1 LoRA done (A: 512 tokens, B: whole-filing chunks); Task 2 fusion model + manual loop done; Task 3 W&B sweep done; next 4 evaluation deep dive, 5 push to HF Hub, 6 docs.
-1. Gains are within noise — add rolling/expanding-window evaluation over multiple test years for tighter estimates.
+0. Day-2 learning plan in progress (user wants concept → code → explanation, one task at a time, wait for "ready"): Task 1 LoRA done (A: 512 tokens, B: whole-filing chunks); Task 2 fusion model + manual loop done; Task 3 W&B sweep, Task 4 evaluation deep dive done; next 5 push to HF Hub, 6 docs.
+1. Evaluate new models with `evaluate.py` (rolling-origin + paired bootstrap), not the single 23-miss window.
 2. More/better text: only 661 samples. 8-K earnings press releases (Ex. 99.1) or call transcripts.
 3. Optional LLM-scored features (hedging, outlook tone, new risks, guidance specificity) — needs Anthropic API key, a few $ per run.
-4. Check whether text signal is just company identity (company-held-out eval).
+4. Done: text signal is company identity (embed → chance on unseen companies). Text features need to be within-company (vs own past filings) or forward-looking (call Q&A, 8-K guidance) to add anything.
 5. Possible upgrades: stronger embedder (e.g. bge-base), Loughran-McDonald dictionary for tone features, gradient boosting.
 
 ## Reference
@@ -115,3 +122,4 @@ signal. Neural late fusion > early fusion on val but < LR history+PCA-16; MLP un
 - **2026-10-23** — Task 1B: `max_chunks` whole-filing chunking (mean-pooled [CLS]) in `model.py`; `train.py` `--max-chunks`, `--grad-accum`, sum-reduced loss (mean reduction cancelled class weights at batch 1). 16 chunks lifts FinBERT test AUC 0.515 → 0.603 (frozen) / 0.611 (LoRA) — confirms truncation was the bottleneck, but still below MiniLM full-text LR (0.703); LoRA adds nothing over frozen. Test F1 low (threshold 0.5 too conservative). Runs in `checkpoints/{frozen,lora_r8}_chunks16/`.
 - **2026-10-26** — Task 2: `fusion.py` (late/early fusion of history + MiniLM embed, hand-written loop, early stop on val AUC, seed ensemble); `baselines.py` refactored to expose `build_table`/`temporal_split` (results unchanged). Late fusion val 0.686 / test 0.734 (seed-ens 0.784, not mirrored on val → likely noise); early fusion val 0.654 (history drowned); MLP history-only worse than LR. LR history+PCA-16 still best by val. Added `docs/08-fusion-model.md`.
 - **2026-10-26** — Task 3: `sweep.py` (W&B Bayesian sweep, 50 runs, objective mean val AUC over 3 seeds, no test); `fusion.py` gained `load_tensors`, `train_one(eval_test, on_epoch)`. Winner (lr 2.3e-3, wd 0.2, history 16, embed 4, hidden 16, dropout 0.53, input-dropout 0.50, batch 64): val 0.734 ± 0.028 / test 0.742 ± 0.032 vs defaults 0.686 / 0.734. Sweep val 0.747 shrank to 0.734 on 5-seed rerun (winner's curse). embed_dim corr −0.75 with val AUC. Still ≤ LR history+PCA-16. Added `docs/09-wandb-sweeps.md`.
+- **2026-10-26** — Task 4: `evaluate.py` (rolling-origin 3 folds, pooled + paired bootstrap, thresholds/top-10%, company-held-out); `build_table` adds `ticker`. Pooled AUC ~0.70; text over history +0.016 (CI incl. 0); embed → 0.481 on unseen companies (company identity). Top-10% precision ~40% (2.7× base). Fusion fold-2024 optimistic (sweep tuned on 2024). Added `docs/10-evaluation-deep-dive.md`.

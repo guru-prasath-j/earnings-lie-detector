@@ -143,6 +143,7 @@ def build_table(data_root: str) -> Tuple[pd.DataFrame, List[str]]:
     for s in ds.samples:
         tk = s["transcript_key"]
         rows.append({
+            "ticker": s["ticker"],
             "date": s["date"][:10],
             "label": s["label"],
             "text": ds.transcripts[tk],

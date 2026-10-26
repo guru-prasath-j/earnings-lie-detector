@@ -47,6 +47,7 @@ MD&A and predicts **miss (1)** vs **met/beat (0)** for the company's next earnin
 | 6. Text features (embeddings, change scores) | `src/models/text_features.py` | [07-text-features.md](07-text-features.md) |
 | 7. Fusion model (history + text, hand-written loop) | `src/models/fusion.py` | [08-fusion-model.md](08-fusion-model.md) |
 | 8. Hyperparameter sweep (W&B) | `src/models/sweep.py` | [09-wandb-sweeps.md](09-wandb-sweeps.md) |
+| 9. Evaluation deep dive (multi-year, paired bootstrap, unseen companies) | `src/models/evaluate.py` | [10-evaluation-deep-dive.md](10-evaluation-deep-dive.md) |
 | (optional) Audio | `src/data/audio_*.py` | [06-audio-pipeline.md](06-audio-pipeline.md) |
 
 ## Three ideas that matter most
@@ -88,6 +89,10 @@ Test set: 169 announcements in 2025–2026, 23 of them misses. AUC 0.5 = coin fl
   better than the logistic regression on val, which is how we choose. → [08-fusion-model.md](08-fusion-model.md)
 - A 50-run W&B sweep tuned it to val 0.73 / test 0.74 — level with logistic regression on history.
   The sweep's main finding: squeeze the text to 4 features, give history more room. → [09-wandb-sweeps.md](09-wandb-sweeps.md)
+- **Deep dive (2023–26 pooled, 58 misses):** best models reach ~0.70 AUC; text adds +0.016 over history
+  [−0.02, +0.05], so not clearly anything. On companies never seen in training, the text embedding
+  drops to chance (0.48): it mostly recognises *which company* wrote the filing.
+  → [10-evaluation-deep-dive.md](10-evaluation-deep-dive.md)
 
 ## What's next
 
