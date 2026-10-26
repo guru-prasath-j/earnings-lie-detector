@@ -124,17 +124,14 @@ def average_models(results: Dict, names: Tuple[str, ...], y_va: np.ndarray, y_te
     return out
 
 
-def main() -> None:
-    p = argparse.ArgumentParser(description="History-only and TF-IDF reference models")
-    p.add_argument("--data-root", default=".")
-    p.add_argument("--val-start", default="2024-01-01")
-    p.add_argument("--test-start", default="2025-01-01")
-    p.add_argument("--output", default="checkpoints/baselines.json")
-    args = p.parse_args()
+def build_table(data_root: str) -> Tuple[pd.DataFrame, List[str]]:
+    """One row per sample: date, label, text, history, change and embedding columns.
 
+    Returns the table and the names of the embedding columns.
+    """
     with contextlib.redirect_stdout(io.StringIO()):
-        ds = EarningsCallDataset(data_root=args.data_root)
-    root = Path(args.data_root)
+        ds = EarningsCallDataset(data_root=data_root)
+    root = Path(data_root)
     hist = history_features(root / "data" / "processed" / "labels.csv")
     change = change_features(ds.transcripts)  # all 664 filings, so "previous filing" is complete
     used = {s["transcript_key"] for s in ds.samples}
@@ -153,14 +150,31 @@ def main() -> None:
             **change.loc[tk].to_dict(),
             **dict(zip(emb_cols, emb[tk])),
         })
-    df = pd.DataFrame(rows)
+    return pd.DataFrame(rows), emb_cols
+
+
+def temporal_split(df: pd.DataFrame, val_start: str, test_start: str) -> Dict[str, pd.DataFrame]:
+    """Same split as ``get_dataloaders(split="temporal")``."""
     parts = {
-        "train": df[df.date < args.val_start],
-        "val": df[(df.date >= args.val_start) & (df.date < args.test_start)],
-        "test": df[df.date >= args.test_start],
+        "train": df[df.date < val_start],
+        "val": df[(df.date >= val_start) & (df.date < test_start)],
+        "test": df[df.date >= test_start],
     }
-    y = {k: v["label"].to_numpy() for k, v in parts.items()}
     logger.info("Split — " + ", ".join(f"{k}: {len(v)} ({int(v.label.sum())} miss)" for k, v in parts.items()))
+    return parts
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="History-only and TF-IDF reference models")
+    p.add_argument("--data-root", default=".")
+    p.add_argument("--val-start", default="2024-01-01")
+    p.add_argument("--test-start", default="2025-01-01")
+    p.add_argument("--output", default="checkpoints/baselines.json")
+    args = p.parse_args()
+
+    df, emb_cols = build_table(args.data_root)
+    parts = temporal_split(df, args.val_start, args.test_start)
+    y = {k: v["label"].to_numpy() for k, v in parts.items()}
 
     # Dense blocks, each standardised on train only
     def dense(cols):

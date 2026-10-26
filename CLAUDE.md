@@ -41,8 +41,9 @@ python src/models/baselines.py --data-root .                                    
 | `src/models/model.py` | `EarningsTextClassifier`: `ProsusAI/finbert` (fallback `distilbert-base-uncased`) → [CLS] → Dropout(0.3) → Linear(768→128) → ReLU → Dropout(0.15) → Linear(128→2). `freeze_encoder` / `freeze_n_layers` / LoRA (`lora_r>0`: peft adapters on query+value, r=8 → 393,602 trainable = 0.36%). `max_chunks>1`: whole filing → 512-token chunks, up to N evenly spaced, [CLS] mean-pooled per doc (`doc_ids`) |
 | `src/models/train.py` | Class-weighted CE (weights from train split), AdamW (head LR = 10× encoder LR), warmup→cosine, AMP on CUDA, early stop on val F1 (patience 3). `--seeds` (default 42–46) → `checkpoints/seed_N/{best_model.pt,training_history.json}` + `checkpoints/summary.json` (mean ± std). `--split temporal|random`, `--val-start`, `--test-start`, `--lora-r/--lora-alpha/--lora-dropout`, `--head-lr`, `--max-chunks`, `--grad-accum` (loss uses `reduction="sum"` / fixed effective batch so class weights survive batch-size 1). Checkpoints hold trainable weights only (~1.6 MB) |
 | `src/models/text_features.py` | `change_features` (cosine/Jaccard/length vs previous and ~1-year-earlier filing, neg/uncertainty word rates) and `document_embeddings` (whole MD&A → 256-token chunks → frozen `all-MiniLM-L6-v2` mean-pooled → avg, 384-dim; cached in `data/processed/embeddings_minilm.npz`, ~1.5 min on GPU) |
-| `src/models/baselines.py` | Logistic regression (balanced, C ∈ 0.001–10 picked by val AUC) on feature blocks alone and combined: `history` (prior-quarter miss/surprise, 4q rolling stats, `shift(1)` so no leakage), `change`, `embed`, `embed_pca{8,16,32}` (PCA fit on train), `tfidf`; plus `avg(history,embed)`. Reports 95% bootstrap AUC range → `checkpoints/baselines.json`. ~1 min |
-| `docs/` | Learning docs: `00-overview.md` (high-level) + one per component (`07-text-features.md` = embeddings/change features) |
+| `src/models/fusion.py` | `FusionNet`: history (5) and MiniLM embed (384) blocks; `--fusion late` (per-block Linear+ReLU branches 5→8, 384→16, concat → MLP → 1 logit) or `early` (raw concat → MLP); `--blocks` for single-branch. Hand-written loop (no DataLoader): BCEWithLogits + `pos_weight`, AdamW 1e-3, early stop on val AUC (patience 20), best `state_dict` deepcopy, 5 seeds + seed-ensemble → `checkpoints/fusion/<config>/summary.json`. ~5 s per config |
+| `src/models/baselines.py` | Logistic regression (balanced, C ∈ 0.001–10 picked by val AUC) on feature blocks alone and combined: `history` (prior-quarter miss/surprise, 4q rolling stats, `shift(1)` so no leakage), `change`, `embed`, `embed_pca{8,16,32}` (PCA fit on train), `tfidf`; plus `avg(history,embed)`. Reports 95% bootstrap AUC range → `checkpoints/baselines.json`. ~1 min. `build_table` / `temporal_split` shared with `fusion.py` |
+| `docs/` | Learning docs: `00-overview.md` (high-level) + one per component (`07-text-features.md` = embeddings/change features, `08-fusion-model.md` = fusion + manual loop) |
 | `notebooks/03_eda.ipynb` | EDA (label distribution, feature tests, correlations, temporal) |
 
 ## Key decisions
@@ -68,15 +69,19 @@ Temporal split, test = 2025–2026 (169 samples, 23 misses), 2026-10-22:
 | History only (C=0.001) | 0.734 | 0.728 [0.61–0.83] | 0.386 |
 | **History + embed PCA-16** (best by val) | **0.752** | **0.752** [0.64–0.85] | 0.351 |
 | avg(history, embed) prob ensemble | 0.660 | 0.718 | 0.328 |
+| MLP history only (5 seeds) | 0.722 ± 0.011 | 0.669 ± 0.011 | 0.353 |
+| MLP embed only (5 seeds) | 0.655 ± 0.017 | 0.695 ± 0.015 | 0.279 |
+| Fusion early (5 seeds) | 0.654 ± 0.014 | 0.732 ± 0.020 | 0.391 |
+| Fusion late (5 seeds; seed-ensemble test 0.784 [0.68–0.87]) | 0.686 ± 0.027 | 0.734 ± 0.019 | 0.337 |
 
 Takeaways: architecture direction = frozen text features + small model, not end-to-end FinBERT (too
 little data, 512-token limit). Full-text embedding is the best text representation; combined with
 history it's best overall (+0.02 val & test) but within noise (23 test misses). Change features: no
-signal. Select configs by val AUC, never test. (Random split had shown FinBERT test AUC 0.646 — optimistic.)
+signal. Neural late fusion > early fusion on val but < LR history+PCA-16; MLP underperforms LR on history alone. Select configs by val AUC, never test. (Random split had shown FinBERT test AUC 0.646 — optimistic.)
 
 ## Open issues / next steps
 
-0. Day-2 learning plan in progress (user wants concept → code → explanation, one task at a time, wait for "ready"): Task 1 LoRA done (A: 512 tokens, B: whole-filing chunks); next Task 2 fusion model + manual loop, 3 W&B sweeps, 4 evaluation deep dive, 5 push to HF Hub, 6 docs.
+0. Day-2 learning plan in progress (user wants concept → code → explanation, one task at a time, wait for "ready"): Task 1 LoRA done (A: 512 tokens, B: whole-filing chunks); Task 2 fusion model + manual loop done; next Task 3 W&B sweeps (start with `fusion.py` late: lr, branch dims, dropout, wd), 4 evaluation deep dive, 5 push to HF Hub, 6 docs.
 1. Gains are within noise — add rolling/expanding-window evaluation over multiple test years for tighter estimates.
 2. More/better text: only 661 samples. 8-K earnings press releases (Ex. 99.1) or call transcripts.
 3. Optional LLM-scored features (hedging, outlook tone, new risks, guidance specificity) — needs Anthropic API key, a few $ per run.
@@ -105,3 +110,4 @@ signal. Select configs by val AUC, never test. (Random split had shown FinBERT t
   embed PCA-16, val/test AUC 0.752 vs history 0.734/0.728. Change features no signal. Added `docs/07-text-features.md`.
 - **2026-10-23** — Task 1A: LoRA (peft, r=8, α=16, q/v) in `model.py`; `train.py` `--lora-*`, `--head-lr`, trainable-only checkpoints. LoRA on 512 tokens: test AUC 0.525 ± 0.029 vs frozen 0.515 — no gain; val AUC usually peaks at epoch 1 then falls (overfits boilerplate). Confirms truncation is the bottleneck. Val F1 is a jumpy early-stopping metric (flips 0↔0.35).
 - **2026-10-23** — Task 1B: `max_chunks` whole-filing chunking (mean-pooled [CLS]) in `model.py`; `train.py` `--max-chunks`, `--grad-accum`, sum-reduced loss (mean reduction cancelled class weights at batch 1). 16 chunks lifts FinBERT test AUC 0.515 → 0.603 (frozen) / 0.611 (LoRA) — confirms truncation was the bottleneck, but still below MiniLM full-text LR (0.703); LoRA adds nothing over frozen. Test F1 low (threshold 0.5 too conservative). Runs in `checkpoints/{frozen,lora_r8}_chunks16/`.
+- **2026-10-26** — Task 2: `fusion.py` (late/early fusion of history + MiniLM embed, hand-written loop, early stop on val AUC, seed ensemble); `baselines.py` refactored to expose `build_table`/`temporal_split` (results unchanged). Late fusion val 0.686 / test 0.734 (seed-ens 0.784, not mirrored on val → likely noise); early fusion val 0.654 (history drowned); MLP history-only worse than LR. LR history+PCA-16 still best by val. Added `docs/08-fusion-model.md`.
