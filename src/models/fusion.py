@@ -40,7 +40,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -50,46 +50,10 @@ from sklearn.preprocessing import StandardScaler
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from baselines import HISTORY_COLS, auc_ci, build_table, metrics, temporal_split  # noqa: E402
+from fusion_net import FusionNet  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("fusion")
-
-
-class FusionNet(nn.Module):
-    """One branch per input block, concatenated, then a small MLP head → 1 logit.
-
-    ``branch_dims`` maps block name → branch output size.  ``early=True`` skips
-    the branches and feeds the raw concatenated inputs straight to the head.
-    """
-
-    def __init__(self, in_dims: Dict[str, int], branch_dims: Dict[str, int], hidden: int = 32,
-                 dropout: float = 0.3, input_dropout: float = 0.2, early: bool = False) -> None:
-        super().__init__()
-        self.blocks = list(in_dims)
-        self.early = early
-        if early:
-            self.branches = nn.ModuleDict()
-            head_in = sum(in_dims.values())
-        else:
-            # Input dropout on the wide text block: randomly hides some of the 384 dims
-            # each step so the branch can't memorise a few of them.
-            self.branches = nn.ModuleDict({
-                b: nn.Sequential(nn.Dropout(input_dropout if in_dims[b] > 32 else 0.0),
-                                 nn.Linear(in_dims[b], branch_dims[b]), nn.ReLU())
-                for b in self.blocks
-            })
-            head_in = sum(branch_dims[b] for b in self.blocks)
-        self.head = nn.Sequential(
-            nn.Dropout(dropout), nn.Linear(head_in, hidden), nn.ReLU(),
-            nn.Dropout(dropout), nn.Linear(hidden, 1),
-        )
-
-    def forward(self, x: Dict[str, torch.Tensor]) -> torch.Tensor:
-        if self.early:
-            z = torch.cat([x[b] for b in self.blocks], dim=1)
-        else:
-            z = torch.cat([self.branches[b](x[b]) for b in self.blocks], dim=1)
-        return self.head(z).squeeze(1)  # (batch,) logits; sigmoid(logit) = P(miss)
 
 
 @torch.no_grad()
@@ -98,26 +62,30 @@ def predict(model: nn.Module, X: Dict[str, torch.Tensor]) -> np.ndarray:
     return torch.sigmoid(model(X)).cpu().numpy()
 
 
-def load_tensors(data_root: str, blocks: List[str], val_start: str, test_start: str, device: torch.device
-                 ) -> Tuple[Dict[str, Dict[str, torch.Tensor]], Dict[str, torch.Tensor]]:
-    """Feature blocks per split, standardised on train only, already on ``device``."""
+def load_tensors(data_root: str, blocks: List[str], val_start: str, test_start: str, device: torch.device,
+                 return_scalers: bool = False):
+    """Feature blocks per split, standardised on train only, already on ``device``.
+
+    Returns (X, y), or (X, y, scalers) with ``return_scalers=True`` (scalers: block → fitted StandardScaler).
+    """
     df, emb_cols = build_table(data_root)
     parts = temporal_split(df, val_start, test_start)
     cols = {"history": HISTORY_COLS, "embed": emb_cols}
     X: Dict[str, Dict[str, torch.Tensor]] = {part: {} for part in parts}
+    scalers = {}
     for b in blocks:
-        scaler = StandardScaler().fit(parts["train"][cols[b]])
+        scaler = scalers[b] = StandardScaler().fit(parts["train"][cols[b]])
         for part, frame in parts.items():
             X[part][b] = torch.tensor(scaler.transform(frame[cols[b]]), dtype=torch.float32, device=device)
     y = {part: torch.tensor(frame["label"].to_numpy(), dtype=torch.float32, device=device)
          for part, frame in parts.items()}
-    return X, y
+    return (X, y, scalers) if return_scalers else (X, y)
 
 
 def train_one(args, X: Dict[str, Dict[str, torch.Tensor]], y: Dict[str, torch.Tensor],
               seed: int, device: torch.device, eval_test: bool = True,
-              on_epoch: Optional[Callable[[Dict], None]] = None) -> Tuple[Dict, Dict[str, np.ndarray]]:
-    """Train one model; returns (result, probabilities).
+              on_epoch: Optional[Callable[[Dict], None]] = None, return_model: bool = False):
+    """Train one model; returns (result, probabilities), plus the model if ``return_model``.
 
     ``eval_test=False`` never touches the test set (used by the sweep).
     ``on_epoch`` is called with each epoch's record (e.g. to log it to W&B).
@@ -184,7 +152,7 @@ def train_one(args, X: Dict[str, Dict[str, torch.Tensor]], y: Dict[str, torch.Te
     if eval_test:
         msg += " | TEST auc=%.3f f1=%.3f" % (result["test"]["auc"], result["test"]["f1"])
     logger.info(msg)
-    return result, probs
+    return (result, probs, model) if return_model else (result, probs)
 
 
 def main() -> None:

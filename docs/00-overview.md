@@ -48,6 +48,7 @@ MD&A and predicts **miss (1)** vs **met/beat (0)** for the company's next earnin
 | 7. Fusion model (history + text, hand-written loop) | `src/models/fusion.py` | [08-fusion-model.md](08-fusion-model.md) |
 | 8. Hyperparameter sweep (W&B) | `src/models/sweep.py` | [09-wandb-sweeps.md](09-wandb-sweeps.md) |
 | 9. Evaluation deep dive (multi-year, paired bootstrap, unseen companies) | `src/models/evaluate.py` | [10-evaluation-deep-dive.md](10-evaluation-deep-dive.md) |
+| 10. Publish to the Hugging Face Hub | `src/models/fusion_net.py`, `push_to_hub.py` | [11-huggingface-hub.md](11-huggingface-hub.md) |
 | (optional) Audio | `src/data/audio_*.py` | [06-audio-pipeline.md](06-audio-pipeline.md) |
 
 ## Three ideas that matter most
