@@ -22,19 +22,26 @@ MD&A and predicts **miss (1)** vs **met/beat (0)** for the company's next earnin
 ## The pipeline at a glance
 
 ```
- SEC EDGAR ──scraper.py──▶ data/raw/transcripts/{TICKER}.json      (664 MD&A texts, 49 companies, 2020–2025)
+ SEC EDGAR ──scraper.py──▶ data/raw/transcripts/{TICKER}.json      (664 MD&A texts, 49 companies, 2020–2026)
  yfinance  ──labeler.py──▶ data/processed/labels.csv               (1,899 announcements: EPS actual vs estimate)
                                    │
                          dataset.py │ pairs each filing with the NEXT announcement after it
                                    ▼
                          661 (text, label) samples, 92 misses (14%)
                                    │
-            ┌──────────────────────┼───────────────────────┐
-            ▼                      ▼                       ▼
-     train.py (FinBERT)    baselines.py (TF-IDF)   baselines.py (history only)
-            └──────────────────────┴───────────────────────┘
-                                   ▼
-                 F1 / AUC on a time-based test set (2025–2026)
+        ┌──────────────────────────┼─────────────────────────────┐
+        ▼                          ▼                             ▼
+  train.py: FinBERT         text_features.py:              baselines.py:
+  (frozen / LoRA,           MiniLM embedding of the        history features
+   512 tokens or chunks)    whole filing, change scores    (past surprises)
+        │                          └──────────────┬──────────────┘
+        │                                         ▼
+        │                    baselines.py (logistic regression) · fusion.py (neural, tuned by sweep.py)
+        └───────────────────────────────┬─────────┘
+                                        ▼
+            evaluate.py: test years 2023 / 2024 / 2025–26, paired bootstrap, unseen companies
+                                        ▼
+                       push_to_hub.py → huggingface.co/Guruprasath12/lie-detect
 ```
 
 | Step | File | Doc |
@@ -65,42 +72,48 @@ MD&A and predicts **miss (1)** vs **met/beat (0)** for the company's next earnin
    86% accurate and useless, so we ignore accuracy and use **F1** and **AUC**, and weight the loss so
    misses count more. → [05-evaluation-and-baselines.md](05-evaluation-and-baselines.md)
 
-## Where we are (2026-10-22)
+## Where we are (2026-10-27)
 
-Test set: 169 announcements in 2025–2026, 23 of them misses. AUC 0.5 = coin flip, 1.0 = perfect.
+### The answer so far
 
-| Model | Val AUC | Test AUC | Test F1 |
+**Partly yes, but not because of the language.** The best models rank upcoming misses clearly better
+than chance (AUC ≈ 0.70 over 2023–26), and flagging the riskiest 10% of announcements finds misses at
+**~2.7× the base rate**. That signal comes from the company's **own earnings track record**. The MD&A
+text adds at most a few hundredths of AUC, and on companies the model hasn't seen, a text-only model
+drops to chance. What the text "knows" is mostly *which company* wrote it.
+
+### The journey (each step has its own doc)
+
+| Step | What we tried | What we learned | Doc |
 |---|---|---|---|
-| FinBERT, first 512 tokens, encoder frozen (5 seeds) | 0.59 | 0.515 ± 0.03 | 0.12 |
-| Change-from-last-quarter scores only | 0.51 | 0.518 | 0.21 |
-| TF-IDF, full text | 0.65 | 0.672 | 0.23 |
-| MiniLM embedding of the full text | 0.65 | 0.703 | 0.31 |
-| Company's past surprises only (no text) | 0.73 | 0.728 | 0.39 |
-| **Past surprises + embedding (PCA-16)** — best | **0.75** | **0.752** | 0.35 |
+| 1 | FinBERT on the first 512 tokens | Test AUC 0.52 = chance. The first 512 tokens are boilerplate | [04](04-model-and-training.md) |
+| 2 | Baselines: past surprises only; TF-IDF of the full text | History alone 0.73; full text 0.67. The bar any text model must clear | [05](05-evaluation-and-baselines.md) |
+| 3 | Frozen MiniLM embedding of the whole filing; "did they rewrite it?" scores | Embedding 0.70, best text representation; rewrite scores: no signal | [07](07-text-features.md) |
+| 4 | LoRA fine-tuning; FinBERT reading 16 chunks of the filing | Whole filing lifts FinBERT to 0.60; fine-tuning adds nothing. Frozen features + small model win | [04](04-model-and-training.md) |
+| 5 | Neural fusion of history + embedding, hand-written loop | Late fusion > early fusion; still ≈ logistic regression | [08](08-fusion-model.md) |
+| 6 | 50-run W&B hyperparameter sweep | Best configs squeeze text to 4 features, give history 16. Winner's curse visible | [09](09-wandb-sweeps.md) |
+| 7 | Evaluation over 3 test years, paired bootstrap, unseen companies | ~0.70 pooled; text gain not significant; text = company identity | [10](10-evaluation-deep-dive.md) |
+| 8 | Published the fusion model with an honest model card | Round-trip test caught a silent branch-order bug | [11](11-huggingface-hub.md) |
 
-**What this tells us**
+### Headline numbers (rolling-origin, test years 2023–26: 403 samples, 58 misses)
 
-- The filing text **does** carry signal, but only when the model reads the whole thing: a frozen
-  embedding of the full text (0.70) beats FinBERT on the first 512 tokens (0.52).
-- A company's own track record is the strongest single predictor.
-- Text + history together is the best so far (+0.02 AUC on both validation and test) — promising,
-  but within the noise of a 23-miss test set. → [07-text-features.md](07-text-features.md)
-- "Did they rewrite the report?" scores showed no signal for next-quarter EPS.
-- A small neural fusion network (history branch + text branch) reaches val 0.69 / test 0.73 — not
-  better than the logistic regression on val, which is how we choose. → [08-fusion-model.md](08-fusion-model.md)
-- A 50-run W&B sweep tuned it to val 0.73 / test 0.74 — level with logistic regression on history.
-  The sweep's main finding: squeeze the text to 4 features, give history more room. → [09-wandb-sweeps.md](09-wandb-sweeps.md)
-- **Deep dive (2023–26 pooled, 58 misses):** best models reach ~0.70 AUC; text adds +0.016 over history
-  [−0.02, +0.05], so not clearly anything. On companies never seen in training, the text embedding
-  drops to chance (0.48): it mostly recognises *which company* wrote the filing.
-  → [10-evaluation-deep-dive.md](10-evaluation-deep-dive.md)
+| Model | Pooled AUC | vs history alone | Precision in top 10% |
+|---|---|---|---|
+| Past surprises only (logistic regression) | 0.693 | — | 30% |
+| Text embedding only | 0.675 | −0.018 | 38% |
+| Past surprises + embedding PCA-16 | **0.708** | +0.016 [−0.02, +0.05] | 40% |
+| Neural late fusion (swept) | 0.705 | +0.012 [−0.05, +0.08] | 38% |
+
+Base rate 14.4%. The ranges in brackets are 95% paired-bootstrap intervals; all of them include 0.
 
 ## What's next
 
-1. Make the gain solid: rolling evaluation over several test years, and more labelled data.
-2. Better text sources (earnings press releases, call transcripts) where management talks about the
-   outlook more directly than in a 10-Q.
-3. Optional: LLM-scored features (hedging, outlook tone, new risks) as another input.
+1. **Text where management talks about the future**: earnings-call Q&A and guidance in 8-K press
+   releases, rather than a 10-Q that describes the past quarter.
+2. **Within-company text features**: how this filing differs from the same company's earlier ones, so
+   the model can't lean on company identity.
+3. **More companies** (49 now, mostly large caps), so company-held-out evaluation means more.
+4. Optional: LLM-scored features (hedging, outlook tone, new risks, guidance specificity).
 
 ## Glossary
 
@@ -111,3 +124,7 @@ Test set: 169 announcements in 2025–2026, 23 of them misses. AUC 0.5 = coin fl
 - **Leakage** — when training or input data contains information that wouldn't be available at
   prediction time, making results look better than they'd be in real use.
 - **Baseline** — a deliberately simple model used as a yardstick.
+- **AUC** — chance a random miss is scored above a random beat; 0.5 = coin flip, 1.0 = perfect.
+- **Rolling-origin evaluation** — repeat train → test with the test year moving forward, always training on the past.
+- **Paired bootstrap** — resample the same test rows for two models to get a confidence interval on their *difference*.
+- **LoRA** — fine-tuning through small low-rank adapter matrices while the original weights stay frozen.

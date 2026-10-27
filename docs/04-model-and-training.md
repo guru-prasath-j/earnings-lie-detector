@@ -57,20 +57,73 @@ checkpoints/
   seed_42/training_history.json   # per-epoch train loss and val metrics
 ```
 
-## Current result and why
+## Fine-tuning cheaply: LoRA
 
-Frozen FinBERT, temporal split, 5 seeds: **test AUC 0.515 ± 0.03, F1 0.12** — no better than chance.
-A full-text TF-IDF model gets AUC 0.67 on the same data, so the signal exists. Likely causes:
+Full fine-tuning updates all ~110M FinBERT weights; with 370 training examples that overfits fast.
+**LoRA** (Low-Rank Adaptation) freezes the original weights and adds a small trainable "adapter"
+next to chosen weight matrices:
 
-1. **Truncation** — an MD&A is 5k–20k tokens; we read the first 512 (~3%), which is mostly the
-   section heading and boilerplate ("This Item should be read in conjunction with…").
-2. **Frozen encoder** — FinBERT was trained for sentiment of single sentences; its [CLS] vector for
-   a long document isn't tuned for this task unless we fine-tune.
+```
+W x  →  W x + (B A) x        W: 768×768 frozen     A: r×768, B: 768×r trainable, r = 8
+```
 
-Fixes to try: chunk the document into 512-token windows and average/max-pool chunk outputs; skip the
-boilerplate opening; fine-tune the top layers.
+`B A` is a rank-8 correction to `W`, at 2 × 768 × 8 ≈ 12k parameters instead of 590k per matrix. `B` starts at
+zero, so training begins from exactly the pre-trained model. We put adapters on the attention
+`query` and `value` matrices in all 12 layers (`peft` library): **393,602 trainable parameters, 0.36%
+of the model**.
+
+```bash
+python src/models/train.py --data-root . --lora-r 8 --lr 2e-4 --head-lr 2e-4 --epochs 10
+```
+
+LoRA needs a higher LR (2e-4) than full fine-tuning (2e-5) because the adapters start at zero and are
+small. Checkpoints store only trainable weights (~1.6 MB instead of ~440 MB).
+
+## Reading the whole filing: chunking + gradient accumulation
+
+A 512-token window sees ~3% of an MD&A. With `--max-chunks N` the tokenizer cuts each document into
+consecutive 512-token chunks (`return_overflowing_tokens=True`) and keeps up to N of them, evenly spaced
+from start to end. Each chunk is encoded separately, and the chunk [CLS] vectors are **mean-pooled per
+document** (`index_add_` by `doc_ids`) before the head.
+
+```bash
+python src/models/train.py --data-root . --lora-r 8 --lr 2e-4 --head-lr 2e-4 \
+    --max-chunks 16 --batch-size 1 --grad-accum 8 --seeds 42 43 44
+```
+
+16 chunks × 512 tokens through FinBERT with gradients only fits one document at a time on our RTX A1000.
+**Gradient accumulation** fakes a bigger batch: `.backward()` *adds* to each parameter's `.grad`, so
+we call it on 8 one-document batches and only then do `optimizer.step()` + `zero_grad()`.
+Effective batch = `batch_size × grad_accum` = 8.
+
+**A subtle bug this exposed:** `CrossEntropyLoss(weight=..., reduction="mean")` divides by the *sum
+of the batch's class weights*. With one document per batch that cancels the weight completely: a
+miss and a beat contribute equally, and class weighting silently does nothing. The fix: use
+`reduction="sum"` and divide by the fixed effective batch size.
+
+## Results (temporal split, test = 2025–26, 23 misses)
+
+| Setup | Val AUC | Test AUC | Test F1 |
+|---|---|---|---|
+| Frozen FinBERT, first 512 tokens (5 seeds) | 0.59 | 0.515 ± 0.03 | 0.12 |
+| LoRA r=8, first 512 tokens (5 seeds) | 0.598 ± 0.034 | 0.525 ± 0.029 | 0.17 |
+| Frozen FinBERT, 16 chunks (3 seeds) | 0.667 ± 0.003 | 0.603 ± 0.011 | 0.07 |
+| LoRA r=8, 16 chunks (3 seeds) | 0.639 ± 0.004 | 0.611 ± 0.020 | 0.12 |
+| *Frozen MiniLM, whole filing + logistic regression* | *0.645* | *0.703* | *0.31* |
+
+- **Truncation was the bottleneck.** Reading the whole filing lifts FinBERT from chance (0.52) to 0.60.
+  LoRA on 512 tokens didn't help: the first 512 tokens are mostly boilerplate, and val AUC peaked at
+  epoch 1 and then fell as it memorised them.
+- **Fine-tuning adds nothing** over a frozen encoder (0.611 vs 0.603), and both trail a frozen MiniLM
+  embedding + logistic regression (0.70). With ~370 training documents, end-to-end fine-tuning of a
+  110M-parameter model can't beat good frozen features plus a small model. The project continued in
+  that direction: [07-text-features.md](07-text-features.md), [08-fusion-model.md](08-fusion-model.md).
+- Test F1 is low because these models rarely score a document above 0.5. See
+  [10-evaluation-deep-dive.md](10-evaluation-deep-dive.md) for thresholds.
 
 ## Concepts to learn here
 
 Transfer learning; tokenisation and context-length limits; fine-tuning vs feature extraction;
-learning-rate schedules; regularisation (dropout, weight decay, early stopping); seed variance.
+learning-rate schedules; regularisation (dropout, weight decay, early stopping); seed variance;
+parameter-efficient fine-tuning (LoRA); long-document chunking and pooling; gradient accumulation;
+how loss reduction interacts with class weights.

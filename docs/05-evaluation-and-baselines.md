@@ -69,11 +69,13 @@ time-based split shows how much a random split flattered it.
 - **Earnings surprises are persistent**: companies that beat tend to keep beating (analysts set
   beatable estimates for some firms). History alone is a strong baseline; any text model must beat
   **AUC ≈ 0.73** to matter.
-- **The text has real signal** (0.67), but part of it may just be identifying *which company* it is
-  (names, product terms), which overlaps with history. A useful test: does text still help after
-  adding a per-company feature?
+- **The text has signal** (0.67), but it turned out to be mostly *which company* wrote it: on companies
+  held out of training, a text-only model drops to chance (AUC 0.48). That overlaps with what history
+  already captures. → [10-evaluation-deep-dive.md](10-evaluation-deep-dive.md)
 - **Small test set**: 23 misses. One extra caught miss moves recall by 4 points. Differences under
-  ~0.03–0.05 AUC are not reliable; multiple seeds and, eventually, more data help.
+  ~0.03–0.05 AUC are not reliable. Over three test years (58 misses) with a paired bootstrap, the
+  +0.024 of history + PCA-16 here shrinks to +0.016 [−0.02, +0.05]: not significant.
+  → [10-evaluation-deep-dive.md](10-evaluation-deep-dive.md)
 
 ## Concepts to learn here
 

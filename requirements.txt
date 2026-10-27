@@ -4,6 +4,8 @@ torchaudio
 transformers
 datasets
 peft
+huggingface_hub
+safetensors
 accelerate
 bitsandbytes
 scikit-learn

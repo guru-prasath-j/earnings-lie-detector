@@ -10,7 +10,7 @@ scripts, a pipeline run, training results, a design decision, a new known issue 
 section below and the **Log** at the bottom (date, what changed, results). Keep it short and factual;
 replace stale info rather than appending contradictions. Commit it together with the code it describes.
 
-Learning docs live in `docs/` (`00-overview.md` = high-level, `01`–`06` = one per component). The user
+Learning docs live in `docs/` (`00-overview.md` = high-level + project journey, `01`–`11` = one per component). `README.md` = GitHub-facing summary. The user
 reads them to learn — when an implementation or result changes, update the matching doc too.
 
 ## Setup on a new machine
@@ -27,7 +27,9 @@ python src/data/scraper.py                                         # → data/ra
 python src/data/labeler.py --transcripts-dir data/raw/transcripts  # → data/processed/labels.csv (~1,899 rows)
 python src/data/dataset.py                                         # sanity check: 661 samples, 92 misses
 python src/models/train.py --data-root . --freeze-encoder --epochs 10 --batch-size 8   # 5 seeds, ~7 min on RTX A1000
-python src/models/baselines.py --data-root .                                          # history / TF-IDF yardsticks, ~30 s
+python src/models/baselines.py --data-root .                                          # LR yardsticks; first run builds MiniLM cache (~1.5 min)
+python src/models/fusion.py --data-root .                                             # neural late fusion, 5 seeds, ~5 s
+python src/models/evaluate.py --data-root .                                           # rolling-origin deep dive → checkpoints/evaluation.json, ~1 min
 ```
 
 ## Pipeline
@@ -55,7 +57,8 @@ python src/models/baselines.py --data-root .                                    
 - **Forward-looking pairing**: a 10-Q is filed right after its own quarter's earnings announcement and already
   states that EPS, so it is paired with the *next* announcement (gap 63–120 days, median 90). Do not revert.
 - **Class imbalance**: ~14% misses. Use `ds.get_class_weights()`; judge on F1/AUC, not accuracy.
-- **Truncation**: MD&A is 5k–20k tokens; model sees the first 512 only.
+- **Truncation**: MD&A is 5k–20k tokens; FinBERT sees the first 512 unless `--max-chunks` > 1. MiniLM embeddings always cover the whole filing.
+- **Model selection**: by val AUC (never test); compare models with `evaluate.py` (rolling-origin + paired bootstrap).
 
 ## Current results
 
@@ -85,14 +88,14 @@ swings ±0.05 and rankings flip. Top-10% watch-list precision ~38–40% vs 14% b
 vs 0.5. **Company-held-out: embed AUC 0.673 → 0.481 (chance)**, history 0.703 → 0.681 — the text embedding
 mostly encodes company identity; no transferable text signal.
 
-Takeaways: architecture direction = frozen text features + small model, not end-to-end FinBERT (too
-little data, 512-token limit). Full-text embedding is the best text representation; combined with
-history it's best overall (+0.02 val & test) but within noise (23 test misses). Change features: no
+Takeaways: frozen text features + small model beat end-to-end FinBERT (too little data). Full-text
+embedding is the best text representation, but its signal is company identity; history drives the
+results, and text over history is not significant. Change features: no
 signal. Neural late fusion > early fusion on val but < LR history+PCA-16; MLP underperforms LR on history alone. Sweep: text branch → 4 dims, history → 16, high input dropout; tuned net ≈ LR history, still < LR history+PCA-16. Select configs by val AUC, never test. (Random split had shown FinBERT test AUC 0.646 — optimistic.)
 
 ## Open issues / next steps
 
-0. Day-2 learning plan in progress (user wants concept → code → explanation, one task at a time, wait for "ready"): Task 1 LoRA done (A: 512 tokens, B: whole-filing chunks); Task 2 fusion model + manual loop done; Task 3 W&B sweep, Task 4 evaluation deep dive done; Task 5 HF Hub done (pushed private); next Task 6 docs.
+0. Day-2 learning plan in progress (user wants concept → code → explanation, one task at a time, wait for "ready"): Task 1 LoRA done (A: 512 tokens, B: whole-filing chunks); Task 2 fusion model + manual loop done; Task 3 W&B sweep, Task 4 evaluation deep dive done; Task 5 HF Hub done (pushed private); Task 6 docs done (doc 04 LoRA/chunking, overview journey + headline, README). Day-2 plan complete.
 1. Evaluate new models with `evaluate.py` (rolling-origin + paired bootstrap), not the single 23-miss window.
 2. More/better text: only 661 samples. 8-K earnings press releases (Ex. 99.1) or call transcripts.
 3. Optional LLM-scored features (hedging, outlook tone, new risks, guidance specificity) — needs Anthropic API key, a few $ per run.
@@ -128,3 +131,4 @@ signal. Neural late fusion > early fusion on val but < LR history+PCA-16; MLP un
 - **2026-10-26** — Task 4: `evaluate.py` (rolling-origin 3 folds, pooled + paired bootstrap, thresholds/top-10%, company-held-out); `build_table` adds `ticker`. Pooled AUC ~0.70; text over history +0.016 (CI incl. 0); embed → 0.481 on unseen companies (company identity). Top-10% precision ~40% (2.7× base). Fusion fold-2024 optimistic (sweep tuned on 2024). Added `docs/10-evaluation-deep-dive.md`.
 - **2026-10-27** — Task 5: `fusion_net.py` (FusionNet moved here + `HubFusionNet` with mixin and scaler buffers), `push_to_hub.py` (train → wrap → save → model card → round-trip check → optional push). `fusion.py`: `load_tensors(return_scalers)`, `train_one(return_model)`. Round-trip caught a silent bug: config.json sorted `in_dims` keys → branch order swapped → fixed with explicit `blocks`. Packaged checkpoint (seed 42, CPU): val 0.723 / test 0.719, 1,989 params. Fusion/sweep outputs unchanged. Added `docs/11-huggingface-hub.md`.
 - **2026-10-27** — Pushed to HF Hub `Guruprasath12/lie-detect` (private); verified `from_pretrained` from the Hub with the downloaded `fusion_net.py`.
+- **2026-10-27** — Task 6 docs: `04` gained LoRA, chunking, grad-accum + class-weight bug, FinBERT results; `00` new pipeline diagram, "where we are" (answer, 8-step journey, pooled headline table), next steps, glossary; `05` caveats point to Task 4 findings; new GitHub `README.md`; `requirements.txt` adds huggingface_hub, safetensors.
