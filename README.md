@@ -34,8 +34,8 @@ about 90 days later.
 | Models | FinBERT (frozen, LoRA, whole-filing chunking) · TF-IDF and MiniLM embeddings with logistic regression · history features · a PyTorch late-fusion network tuned with a W&B Bayesian sweep |
 | Evaluation | AUC and F1 (14% positives), bootstrap intervals, paired bootstrap for model differences, company-held-out cross-validation |
 
-The tuned fusion model is published on the Hugging Face Hub as `Guruprasath12/lie-detect`, with a
-model card covering its limitations. The repo is currently private.
+The tuned fusion model is published on the Hugging Face Hub:
+[Guruprasath12/lie-detect](https://huggingface.co/Guruprasath12/lie-detect), with a model card covering its limitations.
 
 ## Run it
 

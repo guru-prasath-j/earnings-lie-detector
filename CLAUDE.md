@@ -95,7 +95,7 @@ signal. Neural late fusion > early fusion on val but < LR history+PCA-16; MLP un
 
 ## Open issues / next steps
 
-0. Day-2 learning plan in progress (user wants concept → code → explanation, one task at a time, wait for "ready"): Task 1 LoRA done (A: 512 tokens, B: whole-filing chunks); Task 2 fusion model + manual loop done; Task 3 W&B sweep, Task 4 evaluation deep dive done; Task 5 HF Hub done (pushed private); Task 6 docs done (doc 04 LoRA/chunking, overview journey + headline, README). Day-2 plan complete.
+0. Day-2 learning plan in progress (user wants concept → code → explanation, one task at a time, wait for "ready"): Task 1 LoRA done (A: 512 tokens, B: whole-filing chunks); Task 2 fusion model + manual loop done; Task 3 W&B sweep, Task 4 evaluation deep dive done; Task 5 HF Hub done (public); Task 6 docs done (doc 04 LoRA/chunking, overview journey + headline, README). Day-2 plan complete.
 1. Evaluate new models with `evaluate.py` (rolling-origin + paired bootstrap), not the single 23-miss window.
 2. More/better text: only 661 samples. 8-K earnings press releases (Ex. 99.1) or call transcripts.
 3. Optional LLM-scored features (hedging, outlook tone, new risks, guidance specificity) — needs Anthropic API key, a few $ per run.
@@ -108,7 +108,7 @@ signal. Neural late fusion > early fusion on val but < LR history+PCA-16; MLP un
   (Meril1) this repo pushes with a repo-local credential helper reading `~/personal/.secrets/github.env`
   (account guru-prasath-j); the global `~/.git-credentials` login (guruprasath37) can't push here.
 - W&B: Meril1 is logged in to the CoreWeave-hosted server `api.forge.coreweave.com`, entity `guruprasath-nuvo`, project `earnings-lie-detector`. Late-fusion sweep id `0zsaf6qz`.
-- HF Hub: https://huggingface.co/Guruprasath12/lie-detect (**private**, MIT in card). Meril1 `hf auth` user Guruprasath12. Re-push: `python src/models/push_to_hub.py --data-root . --repo-id Guruprasath12/lie-detect --push` (add `--public` to make public).
+- HF Hub: https://huggingface.co/Guruprasath12/lie-detect (**public** since 2026-10-27, MIT in card). Meril1 `hf auth` user Guruprasath12. Re-push: `python src/models/push_to_hub.py --data-root . --repo-id Guruprasath12/lie-detect --push` (visibility is unchanged by re-push).
 - Full project plan: https://claude.ai/artifact/9sTZ183A6ZcowvVVU6n6fX
 
 ## Log
@@ -132,3 +132,4 @@ signal. Neural late fusion > early fusion on val but < LR history+PCA-16; MLP un
 - **2026-10-27** — Task 5: `fusion_net.py` (FusionNet moved here + `HubFusionNet` with mixin and scaler buffers), `push_to_hub.py` (train → wrap → save → model card → round-trip check → optional push). `fusion.py`: `load_tensors(return_scalers)`, `train_one(return_model)`. Round-trip caught a silent bug: config.json sorted `in_dims` keys → branch order swapped → fixed with explicit `blocks`. Packaged checkpoint (seed 42, CPU): val 0.723 / test 0.719, 1,989 params. Fusion/sweep outputs unchanged. Added `docs/11-huggingface-hub.md`.
 - **2026-10-27** — Pushed to HF Hub `Guruprasath12/lie-detect` (private); verified `from_pretrained` from the Hub with the downloaded `fusion_net.py`.
 - **2026-10-27** — Task 6 docs: `04` gained LoRA, chunking, grad-accum + class-weight bug, FinBERT results; `00` new pipeline diagram, "where we are" (answer, 8-step journey, pooled headline table), next steps, glossary; `05` caveats point to Task 4 findings; new GitHub `README.md`; `requirements.txt` adds huggingface_hub, safetensors.
+- **2026-10-27** — Made HF repo `Guruprasath12/lie-detect` public (anonymous download verified); README links it.
