@@ -83,6 +83,10 @@ than chance (AUC ≈ 0.70 over 2023–26), and flagging the riskiest 10% of anno
 text adds at most a few hundredths of AUC, and on companies the model hasn't seen, a text-only model
 drops to chance. What the text "knows" is mostly *which company* wrote it.
 
+**The exception is guidance.** Whether management raised, cut, kept or withdrew its outlook, read with
+simple rules, adds +0.03 AUC on top of history for companies the model has never seen, the first
+significant gain from text ([12](12-press-releases.md)). Not *how* they write, but *what they commit to*.
+
 ### The journey (each step has its own doc)
 
 | Step | What we tried | What we learned | Doc |
@@ -97,6 +101,7 @@ drops to chance. What the text "knows" is mostly *which company* wrote it.
 | 8 | Published the fusion model with an honest model card | Round-trip test caught a silent branch-order bug | [11](11-huggingface-hub.md) |
 | 9 | Text with company identity removed (vs own past filings) | Chance (0.49–0.51); MD&A has no next-quarter signal | [10](10-evaluation-deep-dive.md) §5 |
 | 10 | Earnings press releases (2,115, 2016–26; 1,848 samples) | +0.023 over history (P=0.84, not significant), but text keeps 0.58 on unseen companies (MD&A 0.48) | [12](12-press-releases.md) |
+| 11 | Rule-based guidance features (raised / cut / maintained / withdrawn, hedging) | **First significant gain:** +0.033 over history on unseen companies (P=0.99); over time +0.014–0.028, not significant. Works from MD&A too | [12](12-press-releases.md) |
 
 ### Headline numbers (rolling-origin, test years 2023–26: 403 samples, 58 misses)
 
@@ -111,9 +116,9 @@ Base rate 14.4%. The ranges in brackets are 95% paired-bootstrap intervals; all 
 
 ## What's next
 
-1. **Targeted features from press releases** ([12](12-press-releases.md)): they carry a little
-   transferable signal, but a generic embedding can't separate it from noise. Score specific things
-   instead (guidance raised / cut / withdrawn, hedging). Earnings-call Q&A if a free source turns up.
+1. **Better guidance extraction** ([12](12-press-releases.md)): the rules are ~85% precise and don't
+   read the size of a raise or cut, or whether it concerns EPS or revenue. An LLM could score each
+   release with a fixed schema. Combine MD&A and press-release guidance on shared rows.
 2. **More companies** (49 now, mostly large caps), so company-held-out evaluation means more.
 3. Optional: LLM-scored features (hedging, outlook tone, new risks, guidance specificity).
 

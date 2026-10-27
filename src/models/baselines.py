@@ -42,7 +42,7 @@ from sklearn.preprocessing import StandardScaler
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "data"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from dataset import EarningsCallDataset  # noqa: E402
-from text_features import CHANGE_COLS, change_features, document_embeddings  # noqa: E402
+from text_features import CHANGE_COLS, GUIDANCE_COLS, change_features, document_embeddings, guidance_features  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("baselines")
@@ -131,7 +131,7 @@ def average_models(results: Dict, names: Tuple[str, ...], y_va: np.ndarray, y_te
 
 
 def build_table(data_root: str, text: str = "mda") -> Tuple[pd.DataFrame, List[str]]:
-    """One row per sample: date, label, text, history, change and embedding columns.
+    """One row per sample: date, label, text, history, change, guidance and embedding columns.
 
     ``text`` picks the document source (see ``TEXT_SOURCES``).
     Returns the table and the names of the embedding columns.
@@ -143,6 +143,7 @@ def build_table(data_root: str, text: str = "mda") -> Tuple[pd.DataFrame, List[s
                                  min_transcript_gap_days=src["min_gap"])
     hist = history_features(root / "data" / "processed" / "labels.csv")
     change = change_features(ds.transcripts)  # all filings, so "previous filing" is complete
+    guidance = guidance_features(ds.transcripts)
     used = {s["transcript_key"] for s in ds.samples}
     emb = document_embeddings({k: ds.transcripts[k] for k in used},
                               root / "data" / "processed" / src["cache"])
@@ -158,6 +159,7 @@ def build_table(data_root: str, text: str = "mda") -> Tuple[pd.DataFrame, List[s
             "text": ds.transcripts[tk],
             **hist.loc[(s["ticker"], s["date"])].to_dict(),
             **change.loc[tk].to_dict(),
+            **guidance.loc[tk].to_dict(),
             **dict(zip(emb_cols, emb[tk])),
         })
     return pd.DataFrame(rows), emb_cols

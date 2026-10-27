@@ -58,7 +58,7 @@ from sklearn.preprocessing import StandardScaler
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from baselines import HISTORY_COLS, build_table  # noqa: E402
 from fusion import train_one  # noqa: E402
-from text_features import within_company_embeddings  # noqa: E402
+from text_features import GUIDANCE_COLS, within_company_embeddings  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("evaluate")
@@ -73,6 +73,8 @@ LR_MODELS = [
     "history", "embed", "history+embed_pca16",
     # within-company text (company "accent" removed; see text_features.within_company_embeddings)
     "resid", "history+resid_pca16", "delta", "history+delta_pca16",
+    # rule-based outlook features: guidance raised / cut / maintained / withdrawn, hedging
+    "guidance", "history+guidance", "history+guidance+embed_pca16",
 ]
 CS = (0.001, 0.01, 0.1, 1.0, 10.0)
 # Winner of W&B sweep 0zsaf6qz (picked on the 2024 val year — mildly optimistic for the 2023/2024 folds)
@@ -86,7 +88,7 @@ def make_blocks(model: str, fit: pd.DataFrame, frames: List[pd.DataFrame],
                 cols: Dict[str, List[str]]) -> List[np.ndarray]:
     """Feature matrices for ``frames``; every scaler/PCA is fit on ``fit`` only.
 
-    ``model`` is "+"-joined blocks, each a key of ``cols`` (history, embed, resid, delta),
+    ``model`` is "+"-joined blocks, each a key of ``cols`` (history, embed, resid, delta, guidance),
     optionally with "_pcaN" to compress it to N principal components.
     """
     out = [[] for _ in frames]
@@ -183,7 +185,7 @@ def main() -> None:
     resid, delta = within_company_embeddings(df, emb_cols)
     df = pd.concat([df, resid, delta], axis=1)
     cols = {"history": HISTORY_COLS, "embed": emb_cols,
-            "resid": list(resid.columns), "delta": list(delta.columns)}
+            "resid": list(resid.columns), "delta": list(delta.columns), "guidance": GUIDANCE_COLS}
     models = LR_MODELS + ([] if args.no_fusion else ["fusion_swept"])
     report: Dict = {"folds": {}, "pooled": {}, "company_holdout": {}}
 
@@ -240,6 +242,7 @@ def main() -> None:
     y = df.label.to_numpy()
     splitters = {"random": StratifiedKFold(5, shuffle=True, random_state=0).split(df, y),
                  "by_company": GroupKFold(5).split(df, y, groups=df.ticker)}
+    unseen_prob = {}
     for split_name, splits in splitters.items():
         splits = list(splits)
         for m in LR_MODELS:
@@ -250,23 +253,32 @@ def main() -> None:
                 clf = LogisticRegression(C=fixed_C[m], class_weight="balanced", max_iter=5000).fit(X_tr, tr.label)
                 prob[te_i] = clf.predict_proba(X_te)[:, 1]
             report["company_holdout"].setdefault(m, {})[split_name] = float(roc_auc_score(y, prob))
+            if split_name == "by_company":
+                unseen_prob[m] = prob
+    # Paired bootstrap on unseen companies too: every row is a test row here (2.5× the rolling-origin test)
+    for m, r in bootstrap(y, unseen_prob, ref="history").items():
+        report["company_holdout"][m]["by_company_delta_ci95"] = r["delta_ci95"]
+        report["company_holdout"][m]["by_company_p_delta_gt_0"] = r["p_delta_gt_0"]
 
     # ---- print ----------------------------------------------------------------------
     logger.info("=" * 78)
     logger.info("POOLED rolling-origin test, %d samples / %d misses (base rate %.3f)",
                 len(y_all), int(y_all.sum()), base)
-    logger.info("%-20s %6s %8s %8s %6s %7s %7s %10s  %s", "model", "AUC", "AUC 95%", "", "AP",
+    logger.info("%-28s %6s %8s %8s %6s %7s %7s %10s  %s", "model", "AUC", "AUC 95%", "", "AP",
                 "F1@.5", "F1@val", "top10%", "ΔAUC vs history [95%]  P(Δ>0)")
     for m in models:
         r = report["pooled"][m]
         lo, hi = r["auc_ci95"]
         dlo, dhi = r["delta_ci95"]
-        logger.info("%-20s %6.3f %8.2f–%.2f %6.3f %7.3f %7.3f %5.2f (%s)  %+.3f [%+.3f, %+.3f]  %.2f",
+        logger.info("%-28s %6.3f %8.2f–%.2f %6.3f %7.3f %7.3f %5.2f (%s)  %+.3f [%+.3f, %+.3f]  %.2f",
                     m, r["auc"], lo, hi, r["avg_precision"], r["f1@0.5"], r["f1@tuned"],
                     r["prec_top10"], r["top10_hits"], r["delta_vs_history"], dlo, dhi, r["p_delta_gt_0"])
-    logger.info("Company-held-out (5-fold CV, all years; AUC random → by company):")
+    logger.info("Company-held-out (5-fold CV, all years; AUC random → by company; by-company ΔAUC vs history):")
     for m, r in report["company_holdout"].items():
-        logger.info("  %-20s %.3f → %.3f", m, r["random"], r["by_company"])
+        dlo, dhi = r["by_company_delta_ci95"]
+        logger.info("  %-28s %.3f → %.3f  %+.3f [%+.3f, %+.3f]  P(Δ>0)=%.2f", m, r["random"], r["by_company"],
+                    r["by_company"] - report["company_holdout"]["history"]["by_company"], dlo, dhi,
+                    r["by_company_p_delta_gt_0"])
 
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)

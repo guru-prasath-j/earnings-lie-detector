@@ -91,3 +91,12 @@ confidence intervals; not selecting models on the test set.
 "accent" removed: `resid` (minus the mean of the company's earlier filings) and `delta` (minus its previous
 filing). Only earlier rows are used. Running mean via `cumsum` minus the current row, divided by
 `cumcount`. Result: no signal, see [10-evaluation-deep-dive.md](10-evaluation-deep-dive.md) section 5.
+
+## Guidance features (rule-based)
+
+`guidance_features(docs)` reads only the sentences that mention *guidance / outlook / forecast*, skips
+boilerplate, and labels each by the direction verb closest to that noun (within 40 characters): raise,
+cut, maintain, narrow, initiate, withdraw. Per document it returns those counts, `g_net` =
+sign(raise − cut), `has_outlook`, `n_outlook` and a hedging-word rate in the outlook sentences. About 3 s
+for 2,000 press releases. This is the first text feature that transfers to unseen companies; results in
+[12-press-releases.md](12-press-releases.md).

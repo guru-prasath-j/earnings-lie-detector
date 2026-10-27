@@ -21,6 +21,10 @@ about 90 days later.
 - **Earnings press releases do a little better than the 10-Q.** 2,115 releases (8-K, Exhibit 99.1) give
   1,848 samples. Text alone keeps AUC 0.58 on unseen companies (10-Q: 0.48), but the gain over history
   (+0.023, P(Δ>0)=0.84) is still not significant.
+- **What management says about guidance carries real signal.** Simple rules detect raised / cut /
+  maintained / withdrawn guidance. Added to history, they give the project's first significant gain:
+  +0.033 AUC on unseen companies (95% interval [+0.004, +0.062]). Over time the gain is +0.01–0.03 and
+  not significant. Releases that cut guidance precede a miss 44% of the time, raises only 6%.
 - **Reading the whole document matters more than fine-tuning.** FinBERT on the first 512 tokens scores
   at chance. Reading 16 chunks of the filing lifts it to 0.60, and LoRA fine-tuning adds nothing on top.
   A frozen MiniLM embedding of the full text with logistic regression does better (0.70 on 2025–26).

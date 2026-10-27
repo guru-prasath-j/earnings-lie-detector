@@ -87,3 +87,66 @@ sample covers more announcements per company and year. Comparisons are only vali
 
 Possible next steps: score the release for specific things (guidance raised / cut / withdrawn, hedging)
 instead of a generic embedding, or combine MD&A and press release on their shared rows.
+
+## Step 3: targeted guidance features (2026-10-27)
+
+A generic embedding squeezes 16,000 characters into one vector, and one sentence like *"we are raising
+our full-year EPS guidance"* gets diluted. So we read that sentence directly, with rules
+(`text_features.guidance_features`):
+
+1. Split the release into sentences. Keep those mentioning **guidance / outlook / forecast**, minus
+   boilerplate ("forward-looking", "reconciliation… without unreasonable effort", "accounting guidance").
+2. In each, find the **direction verb closest** to that noun (within 40 characters): raise, cut,
+   maintain (reaffirm, reiterate), narrow, initiate (reinstate, introduce), withdraw (suspend, "not providing").
+   Verb forms only: bare "increase" and "lower" are usually a noun or an adjective ("an increase of 2%",
+   "lower than expected").
+3. Features per release: `has_outlook`, `n_outlook`, counts `g_raise`, `g_cut`, `g_maintain`, `g_narrow`,
+   `g_initiate`, `g_withdraw`, `g_net` = sign(raise − cut), and `outlook_hedge_rate` (words like
+   *uncertain, headwinds, cautious, tariffs* per 1,000 words in outlook sentences).
+
+The rules were tuned by **reading sampled matches for precision, without looking at labels**. The first
+version's "cut" was ~50% right (it caught "lower than expected"); after tightening, ~85%.
+
+### Simple tables first
+
+| Next-quarter miss rate | With | Without |
+|---|---|---|
+| Guidance raised (233 releases) | **6.0%** | 14.7% |
+| Guidance cut, net (16) | **43.8%** | 14.3% |
+| Guidance maintained (145) | 8.3% | 14.0% |
+| Any outlook section (1,206) | 10.8% | 18.8% |
+| Heavy hedging in outlook (122) | 20.5% | 13.1% |
+
+Striking, but a company that raises guidance has usually been beating already, which history captures.
+The models answer whether guidance adds anything *beyond* that.
+
+### Results
+
+| Model | Rolling-origin pooled AUC | Δ vs history [95%], P(Δ>0) | Unseen companies | Δ vs history [95%], P(Δ>0) |
+|---|---|---|---|---|
+| history | 0.653 | — | 0.646 | — |
+| guidance alone | 0.581 | | 0.606 | |
+| history + guidance | 0.667 | +0.014 [−0.038, +0.064], 0.68 | 0.679 | **+0.033 [+0.004, +0.062], 0.99** |
+| history + guidance + embed PCA-16 | 0.678 | +0.025 [−0.033, +0.083], 0.80 | 0.684 | **+0.039 [+0.006, +0.072], 0.99** |
+
+The unseen-company column now has its own paired bootstrap: every one of the 1,848 rows is a test row
+once, so it has 2.5× the evidence of the rolling-origin test.
+
+- **Guidance transfers across companies.** Alone it scores 0.612 with random folds and 0.606 on unseen
+  companies, almost no drop. The embedding fell from 0.717 to 0.580. Guidance means the same thing for
+  every company.
+- **The first interval in this project that excludes zero:** history + guidance on unseen companies.
+- **Over time, the gain is smaller and not significant** (+0.014 to +0.025).
+- **The same features from the 10-Q MD&A agree.** history + guidance 0.720 vs history 0.693 (+0.028,
+  P = 0.92), the best MD&A model; on unseen companies +0.022 (P = 0.87).
+
+### Caveats
+
+- Company-held-out CV ignores time order: models train on later years too. It is a diagnostic.
+- About ten models are compared, so one P = 0.99 is less rare than it looks. But two related models,
+  and a second document (MD&A), point the same way.
+- n is small for the strongest classes: 21 releases with a cut, 26 with a withdrawal.
+
+**Bottom line:** the first text feature that carries real, transferable signal is *what management
+says about guidance*, not how the text "feels" overall. It adds about +0.02–0.04 AUC on top of history,
+significant on unseen companies, suggestive over time.
