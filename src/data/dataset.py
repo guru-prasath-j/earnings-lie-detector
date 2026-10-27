@@ -52,6 +52,11 @@ class EarningsCallDataset(Dataset):
     max_transcript_gap_days : int
         Maximum days between a filing and the next earnings announcement for
         the filing to be attached to that announcement's label.
+    min_transcript_gap_days : int
+        Minimum days between them.  0 for 10-Qs (filed weeks after their own
+        announcement).  Use ~30 for earnings press releases, which are filed *on*
+        announcement day and state that day's EPS: if the label date is off by a
+        day, a 0-day minimum could pair a release with its own result.
     use_audio : bool
         Load audio features and return them in each sample.  Off by default:
         the dataset is then text-only and samples without a transcript are
@@ -65,11 +70,13 @@ class EarningsCallDataset(Dataset):
         audio_features_path: Optional[str | Path] = None,
         transcripts_dir: Optional[str | Path] = None,
         max_transcript_gap_days: int = 120,
+        min_transcript_gap_days: int = 0,
         use_audio: bool = False,
     ) -> None:
         super().__init__()
         self.data_root = Path(data_root)
         self.max_transcript_gap_days = max_transcript_gap_days
+        self.min_transcript_gap_days = min_transcript_gap_days
         self.use_audio = use_audio
 
         # --- Labels ----------------------------------------------------------
@@ -178,13 +185,14 @@ class EarningsCallDataset(Dataset):
         logger.info("Loaded %d transcripts", len(self.transcripts))
 
     def _match_transcript(self, ticker: str, date: str) -> Optional[Tuple[str, str]]:
-        """Return the transcript key for the latest filing strictly before *date*."""
+        """Return the transcript key for the latest filing at least ``min_transcript_gap_days``
+        (and strictly) before *date*."""
         ann = pd.to_datetime(date[:10], errors="coerce")
         if pd.isna(ann):
             return None
         best = None
         for ts in self._transcript_dates.get(ticker, []):
-            if ts >= ann:
+            if ts >= ann or (ann - ts).days < self.min_transcript_gap_days:
                 break
             best = ts
         if best is None or (ann - best).days > self.max_transcript_gap_days:

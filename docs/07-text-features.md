@@ -84,3 +84,10 @@ Picking whichever row looks best on test would be fitting to the test set.
 Embeddings and mean pooling; chunking long documents; frozen feature extractors vs fine-tuning;
 dimensionality reduction (PCA); regularisation across feature blocks; ensembles; bootstrap
 confidence intervals; not selecting models on the test set.
+
+## Within-company embeddings (added 2026-10-27)
+
+`within_company_embeddings(df, emb_cols)` returns two versions of each embedding with the company's
+"accent" removed: `resid` (minus the mean of the company's earlier filings) and `delta` (minus its previous
+filing). Only earlier rows are used. Running mean via `cumsum` minus the current row, divided by
+`cumcount`. Result: no signal, see [10-evaluation-deep-dive.md](10-evaluation-deep-dive.md) section 5.

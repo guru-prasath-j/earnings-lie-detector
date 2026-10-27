@@ -49,6 +49,12 @@ logger = logging.getLogger("baselines")
 
 HISTORY_COLS = ["prev_miss", "prev_surprise", "miss_rate_4q", "mean_surprise_4q", "std_surprise_4q"]
 
+# Text sources: folder of {TICKER}.json, embedding cache, min days between text and the label it predicts
+TEXT_SOURCES = {
+    "mda": {"dir": "data/raw/transcripts", "cache": "embeddings_minilm.npz", "min_gap": 0},          # 10-Q MD&A
+    "press": {"dir": "data/raw/press_releases", "cache": "embeddings_minilm_press.npz", "min_gap": 30},  # 8-K EX-99.1
+}
+
 
 def history_features(labels_csv: Path) -> pd.DataFrame:
     """Per (ticker, date) features built only from *earlier* announcements."""
@@ -124,19 +130,22 @@ def average_models(results: Dict, names: Tuple[str, ...], y_va: np.ndarray, y_te
     return out
 
 
-def build_table(data_root: str) -> Tuple[pd.DataFrame, List[str]]:
+def build_table(data_root: str, text: str = "mda") -> Tuple[pd.DataFrame, List[str]]:
     """One row per sample: date, label, text, history, change and embedding columns.
 
+    ``text`` picks the document source (see ``TEXT_SOURCES``).
     Returns the table and the names of the embedding columns.
     """
-    with contextlib.redirect_stdout(io.StringIO()):
-        ds = EarningsCallDataset(data_root=data_root)
     root = Path(data_root)
+    src = TEXT_SOURCES[text]
+    with contextlib.redirect_stdout(io.StringIO()):
+        ds = EarningsCallDataset(data_root=data_root, transcripts_dir=root / src["dir"],
+                                 min_transcript_gap_days=src["min_gap"])
     hist = history_features(root / "data" / "processed" / "labels.csv")
-    change = change_features(ds.transcripts)  # all 664 filings, so "previous filing" is complete
+    change = change_features(ds.transcripts)  # all filings, so "previous filing" is complete
     used = {s["transcript_key"] for s in ds.samples}
     emb = document_embeddings({k: ds.transcripts[k] for k in used},
-                              root / "data" / "processed" / "embeddings_minilm.npz")
+                              root / "data" / "processed" / src["cache"])
     emb_cols = [f"emb_{i}" for i in range(len(next(iter(emb.values()))))]
 
     rows = []

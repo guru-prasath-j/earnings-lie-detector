@@ -18,6 +18,9 @@ about 90 days later.
 - **The text signal is company identity.** With companies held out of training, a text-only model
   drops from AUC 0.67 to 0.48 (chance). It had learned *which company* wrote the filing, not *how* it
   was written.
+- **Earnings press releases do a little better than the 10-Q.** 2,115 releases (8-K, Exhibit 99.1) give
+  1,848 samples. Text alone keeps AUC 0.58 on unseen companies (10-Q: 0.48), but the gain over history
+  (+0.023, P(Δ>0)=0.84) is still not significant.
 - **Reading the whole document matters more than fine-tuning.** FinBERT on the first 512 tokens scores
   at chance. Reading 16 chunks of the filing lifts it to 0.60, and LoRA fine-tuning adds nothing on top.
   A frozen MiniLM embedding of the full text with logistic regression does better (0.70 on 2025–26).
@@ -29,7 +32,7 @@ about 90 days later.
 
 | Stage | Details |
 |---|---|
-| Data | 664 10-Q MD&A sections from SEC EDGAR (49 large US companies, 2020–2026); EPS actual vs estimate from Yahoo Finance. Each filing is paired with the **next** announcement, so the text never contains the answer |
+| Data | 664 10-Q MD&A sections and 2,115 earnings press releases (8-K Ex. 99.1) from SEC EDGAR (49 large US companies, 2016–2026); EPS actual vs estimate from Yahoo Finance. Each filing is paired with the **next** announcement, so the text never contains the answer |
 | Split | By time: train 2020–23, validate 2024, test 2025–26. Plus rolling-origin folds testing 2023, 2024 and 2025–26 |
 | Models | FinBERT (frozen, LoRA, whole-filing chunking) · TF-IDF and MiniLM embeddings with logistic regression · history features · a PyTorch late-fusion network tuned with a W&B Bayesian sweep |
 | Evaluation | AUC and F1 (14% positives), bootstrap intervals, paired bootstrap for model differences, company-held-out cross-validation |
@@ -48,6 +51,8 @@ python src/data/labeler.py --transcripts-dir data/raw/transcripts  # yfinance �
 python src/models/baselines.py --data-root .                       # logistic-regression models, ~1 min
 python src/models/fusion.py --data-root .                          # neural fusion, 5 seeds, ~5 s
 python src/models/evaluate.py --data-root .                        # multi-year evaluation, ~1 min
+python src/data/press_releases.py                                  # 8-K earnings press releases, ~50 min
+python src/models/evaluate.py --data-root . --text press           # same evaluation on press releases
 python src/models/train.py --data-root . --freeze-encoder          # FinBERT, ~7 min on a laptop GPU
 ```
 

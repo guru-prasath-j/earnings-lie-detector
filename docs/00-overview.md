@@ -56,6 +56,7 @@ MD&A and predicts **miss (1)** vs **met/beat (0)** for the company's next earnin
 | 8. Hyperparameter sweep (W&B) | `src/models/sweep.py` | [09-wandb-sweeps.md](09-wandb-sweeps.md) |
 | 9. Evaluation deep dive (multi-year, paired bootstrap, unseen companies) | `src/models/evaluate.py` | [10-evaluation-deep-dive.md](10-evaluation-deep-dive.md) |
 | 10. Publish to the Hugging Face Hub | `src/models/fusion_net.py`, `push_to_hub.py` | [11-huggingface-hub.md](11-huggingface-hub.md) |
+| 11. Earnings press releases (8-K Ex. 99.1) as a second text source | `src/data/press_releases.py`, `evaluate.py --text press` | [12-press-releases.md](12-press-releases.md) |
 | (optional) Audio | `src/data/audio_*.py` | [06-audio-pipeline.md](06-audio-pipeline.md) |
 
 ## Three ideas that matter most
@@ -94,6 +95,8 @@ drops to chance. What the text "knows" is mostly *which company* wrote it.
 | 6 | 50-run W&B hyperparameter sweep | Best configs squeeze text to 4 features, give history 16. Winner's curse visible | [09](09-wandb-sweeps.md) |
 | 7 | Evaluation over 3 test years, paired bootstrap, unseen companies | ~0.70 pooled; text gain not significant; text = company identity | [10](10-evaluation-deep-dive.md) |
 | 8 | Published the fusion model with an honest model card | Round-trip test caught a silent branch-order bug | [11](11-huggingface-hub.md) |
+| 9 | Text with company identity removed (vs own past filings) | Chance (0.49–0.51); MD&A has no next-quarter signal | [10](10-evaluation-deep-dive.md) §5 |
+| 10 | Earnings press releases (2,115, 2016–26; 1,848 samples) | +0.023 over history (P=0.84, not significant), but text keeps 0.58 on unseen companies (MD&A 0.48) | [12](12-press-releases.md) |
 
 ### Headline numbers (rolling-origin, test years 2023–26: 403 samples, 58 misses)
 
@@ -108,12 +111,11 @@ Base rate 14.4%. The ranges in brackets are 95% paired-bootstrap intervals; all 
 
 ## What's next
 
-1. **Text where management talks about the future**: earnings-call Q&A and guidance in 8-K press
-   releases, rather than a 10-Q that describes the past quarter.
-2. **Within-company text features**: how this filing differs from the same company's earlier ones, so
-   the model can't lean on company identity.
-3. **More companies** (49 now, mostly large caps), so company-held-out evaluation means more.
-4. Optional: LLM-scored features (hedging, outlook tone, new risks, guidance specificity).
+1. **Targeted features from press releases** ([12](12-press-releases.md)): they carry a little
+   transferable signal, but a generic embedding can't separate it from noise. Score specific things
+   instead (guidance raised / cut / withdrawn, hedging). Earnings-call Q&A if a free source turns up.
+2. **More companies** (49 now, mostly large caps), so company-held-out evaluation means more.
+3. Optional: LLM-scored features (hedging, outlook tone, new risks, guidance specificity).
 
 ## Glossary
 

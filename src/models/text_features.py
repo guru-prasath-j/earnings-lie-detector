@@ -12,6 +12,10 @@ Text features for the beat/miss task, computed per filing (``(ticker, filing_dat
    each chunk embedded with a frozen sentence-embedding model
    (``all-MiniLM-L6-v2``, 384-dim), then averaged.  Cached to disk.
 
+3. **Within-company embeddings** — the embedding minus the same company's
+   earlier filings (their running mean, or just the previous one), which
+   removes the company's recognisable writing style ("identity").
+
 Only text from the filing itself and from *earlier* filings is used, so there
 is no look-ahead.
 """
@@ -170,3 +174,29 @@ def document_embeddings(
              chunk_tokens=np.array(chunk_tokens))
     logger.info("Saved %d embeddings to %s", len(out), cache_path)
     return out
+
+
+def within_company_embeddings(df: pd.DataFrame, emb_cols: List[str], group_col: str = "ticker",
+                              order_col: str = "date") -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Remove each company's "accent" from its filing embeddings.
+
+    Returns two frames aligned with ``df`` (columns ``resid_i`` and ``delta_i``):
+      resid — embedding minus the mean of the same company's *earlier* rows
+      delta — embedding minus the company's previous row
+    Only earlier rows are used, so there is no look-ahead.  A company's first row has
+    no history and gets 0 ("typical").
+    """
+    order = df.sort_values([group_col, order_col]).index
+    E = df.loc[order, emb_cols].to_numpy(dtype=np.float64)
+    groups = df.loc[order, group_col].to_numpy()
+    g = pd.DataFrame(E).groupby(groups)
+    n_before = g.cumcount().to_numpy()[:, None]               # earlier rows of the same company
+    sum_before = g.cumsum().to_numpy() - E                    # their sum (cumsum includes this row)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        resid = np.where(n_before > 0, E - sum_before / n_before, 0.0)
+    prev = g.shift(1).to_numpy()
+    delta = np.nan_to_num(E - prev, nan=0.0)
+    n = len(emb_cols)
+    resid = pd.DataFrame(resid, index=order, columns=[f"resid_{i}" for i in range(n)]).reindex(df.index)
+    delta = pd.DataFrame(delta, index=order, columns=[f"delta_{i}" for i in range(n)]).reindex(df.index)
+    return resid, delta

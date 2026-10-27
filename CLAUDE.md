@@ -30,6 +30,8 @@ python src/models/train.py --data-root . --freeze-encoder --epochs 10 --batch-si
 python src/models/baselines.py --data-root .                                          # LR yardsticks; first run builds MiniLM cache (~1.5 min)
 python src/models/fusion.py --data-root .                                             # neural late fusion, 5 seeds, ~5 s
 python src/models/evaluate.py --data-root .                                           # rolling-origin deep dive → checkpoints/evaluation.json, ~1 min
+python src/data/press_releases.py                                                     # → data/raw/press_releases/{TICKER}.json (2,115 releases, 50 tickers), ~50 min
+python src/models/evaluate.py --data-root . --text press                              # → checkpoints/evaluation_press.json (first run embeds, ~1.5 min)
 ```
 
 ## Pipeline
@@ -37,19 +39,20 @@ python src/models/evaluate.py --data-root .                                     
 | File | Role |
 |---|---|
 | `src/data/scraper.py` | SEC EDGAR 10-Q MD&A text → flat `data/raw/transcripts/{TICKER}.json` (list of records: `company`, `date`=filing date, `quarter`, `form`, `mda_text`, …) plus combined `_all_transcripts.json` |
+| `src/data/press_releases.py` | 8-K Item 2.02 earnings press releases: submissions API (all pages — banks' "recent" covers ~1 yr) → `-index.htm` Type `EX-99.1` (fallback filename `ex991`, any `EX-99.*`) → text without tables (kept if narrative < 1,500 chars), SGML header cut. Reuses `scraper.py` helpers. Records `date`/`text` like MD&A → `data/raw/press_releases/{T}.json`. Default 2016-07-01 → today. XOM 1 release, BLK 9 |
 | `src/data/labeler.py` | Default `--method direct`: yfinance `get_earnings_dates` (history back to ~2014, `lookback_quarters=40`) → one row per earnings announcement; `label = 1 if eps_actual < eps_estimate`. `date` = announcement date. Reads both `{T}.json` and `{T}/*.json` layouts, skips `_*` files |
-| `src/data/dataset.py` | `EarningsCallDataset`. Pairs each label (announcement date) with the latest filing **strictly before** it within 120 days (`max_transcript_gap_days`). `use_audio=False` by default → text-only, drops labels with no filing, batches have no audio keys. `get_dataloaders(split="temporal")` default: train < 2024-01-01 (370, 48 miss), val 2024 (122, 21), test ≥ 2025-01-01 (169, 23); `split="random"` still available |
+| `src/data/dataset.py` | `EarningsCallDataset`. Pairs each label (announcement date) with the latest filing **strictly before** it within 120 days (`max_transcript_gap_days`) and at least `min_transcript_gap_days` (default 0; 30 for press releases) before it. `transcripts_dir` picks the text source. `use_audio=False` by default → text-only, drops labels with no filing, batches have no audio keys. `get_dataloaders(split="temporal")` default: train < 2024-01-01 (370, 48 miss), val 2024 (122, 21), test ≥ 2025-01-01 (169, 23); `split="random"` still available |
 | `src/data/audio_downloader.py`, `audio_features.py` | Optional audio pipeline (Earnings-21/22 HF datasets → ~20–28 librosa features). Not run here; won't join to labels (benchmark calls ≠ our tickers/dates). Downloads ~20–35 GB if run without `--max-calls` |
 | `src/models/model.py` | `EarningsTextClassifier`: `ProsusAI/finbert` (fallback `distilbert-base-uncased`) → [CLS] → Dropout(0.3) → Linear(768→128) → ReLU → Dropout(0.15) → Linear(128→2). `freeze_encoder` / `freeze_n_layers` / LoRA (`lora_r>0`: peft adapters on query+value, r=8 → 393,602 trainable = 0.36%). `max_chunks>1`: whole filing → 512-token chunks, up to N evenly spaced, [CLS] mean-pooled per doc (`doc_ids`) |
 | `src/models/train.py` | Class-weighted CE (weights from train split), AdamW (head LR = 10× encoder LR), warmup→cosine, AMP on CUDA, early stop on val F1 (patience 3). `--seeds` (default 42–46) → `checkpoints/seed_N/{best_model.pt,training_history.json}` + `checkpoints/summary.json` (mean ± std). `--split temporal|random`, `--val-start`, `--test-start`, `--lora-r/--lora-alpha/--lora-dropout`, `--head-lr`, `--max-chunks`, `--grad-accum` (loss uses `reduction="sum"` / fixed effective batch so class weights survive batch-size 1). Checkpoints hold trainable weights only (~1.6 MB) |
-| `src/models/text_features.py` | `change_features` (cosine/Jaccard/length vs previous and ~1-year-earlier filing, neg/uncertainty word rates) and `document_embeddings` (whole MD&A → 256-token chunks → frozen `all-MiniLM-L6-v2` mean-pooled → avg, 384-dim; cached in `data/processed/embeddings_minilm.npz`, ~1.5 min on GPU) |
+| `src/models/text_features.py` | `change_features` (cosine/Jaccard/length vs previous and ~1-year-earlier filing, neg/uncertainty word rates) and `within_company_embeddings` (`resid` = emb − mean of company's earlier rows, `delta` = emb − previous row; first row 0) and `document_embeddings` (whole MD&A → 256-token chunks → frozen `all-MiniLM-L6-v2` mean-pooled → avg, 384-dim; cached in `data/processed/embeddings_minilm.npz`, ~1.5 min on GPU) |
 | `src/models/fusion_net.py` | Self-contained (torch + huggingface_hub) `FusionNet` and `HubFusionNet` (`PyTorchModelHubMixin`; explicit `blocks` list because config.json sorts keys; train scaler mean/std as buffers → takes raw features; `predict_proba(history, embedding)`) |
 | `src/models/push_to_hub.py` | Trains swept fusion (seed 42, CPU, `evaluate.FUSION_CFG`), wraps in `HubFusionNet`, `save_pretrained` → `checkpoints/hub/earnings-miss-fusion/` + model card + `fusion_net.py`, asserts identical preds after `from_pretrained`. Uploads only with `--push --repo-id` (private unless `--public`); needs `hf auth login` |
 | `src/models/fusion.py` | `FusionNet` (imported from `fusion_net.py`): history (5) and MiniLM embed (384) blocks; `--fusion late` (per-block Linear+ReLU branches 5→8, 384→16, concat → MLP → 1 logit) or `early` (raw concat → MLP); `--blocks` for single-branch. Hand-written loop (no DataLoader): BCEWithLogits + `pos_weight`, AdamW 1e-3, early stop on val AUC (patience 20), best `state_dict` deepcopy, 5 seeds + seed-ensemble → `checkpoints/fusion/<config>/summary.json`. ~5 s per config |
 | `src/models/sweep.py` | W&B Bayesian sweep over late-fusion lr, weight_decay, branch dims, hidden, dropouts, batch size. Objective = mean val AUC over 3 seeds; never evaluates test. `--best ENTITY/PROJECT/ID` prints the `fusion.py` command for the winner (test once, `checkpoints/fusion/late_swept`). `--dry-run` works without login. Needs `wandb login` |
-| `src/models/evaluate.py` | Deep dive → `checkpoints/evaluation.json`, ~1 min: rolling-origin folds (test 2023 / 2024 / 2025–26, val = preceding year, train = all earlier) for LR history / embed / history+pca16 + swept fusion; pooled AUC + paired-bootstrap ΔAUC vs history; F1 @0.5 vs val-tuned threshold, avg precision, precision in top 10%; company-held-out (GroupKFold by ticker vs random 5-fold) |
-| `src/models/baselines.py` | Logistic regression (balanced, C ∈ 0.001–10 picked by val AUC) on feature blocks alone and combined: `history` (prior-quarter miss/surprise, 4q rolling stats, `shift(1)` so no leakage), `change`, `embed`, `embed_pca{8,16,32}` (PCA fit on train), `tfidf`; plus `avg(history,embed)`. Reports 95% bootstrap AUC range → `checkpoints/baselines.json`. ~1 min. `build_table` (now incl. `ticker`) / `temporal_split` shared with `fusion.py`, `evaluate.py` |
-| `docs/` | Learning docs: `00-overview.md` (high-level) + one per component (`07-text-features.md` = embeddings/change features, `08-fusion-model.md` = fusion + manual loop, `09-wandb-sweeps.md`, `10-evaluation-deep-dive.md`, `11-huggingface-hub.md`) |
+| `src/models/evaluate.py` | Deep dive → `checkpoints/evaluation.json`, ~1 min: rolling-origin folds (test 2023 / 2024 / 2025–26, val = preceding year, train = all earlier) for LR history / embed / history+embed_pca16 / resid / history+resid_pca16 / delta / history+delta_pca16 + swept fusion (blocks via generic `make_blocks`, `_pcaN` suffix); `--text press` → `checkpoints/evaluation_press.json`; pooled AUC + paired-bootstrap ΔAUC vs history; F1 @0.5 vs val-tuned threshold, avg precision, precision in top 10%; company-held-out (GroupKFold by ticker vs random 5-fold, C from the 2025-26 fold) |
+| `src/models/baselines.py` | Logistic regression (balanced, C ∈ 0.001–10 picked by val AUC) on feature blocks alone and combined: `history` (prior-quarter miss/surprise, 4q rolling stats, `shift(1)` so no leakage), `change`, `embed`, `embed_pca{8,16,32}` (PCA fit on train), `tfidf`; plus `avg(history,embed)`. Reports 95% bootstrap AUC range → `checkpoints/baselines.json`. ~1 min. `build_table(data_root, text="mda"|"press")` (incl. `ticker`; `TEXT_SOURCES` = dir, embedding cache, min gap) / `temporal_split` shared with `fusion.py`, `evaluate.py` |
+| `docs/` | Learning docs: `00-overview.md` (high-level) + one per component (`07-text-features.md` = embeddings/change features, `08-fusion-model.md` = fusion + manual loop, `09-wandb-sweeps.md`, `10-evaluation-deep-dive.md`, `11-huggingface-hub.md`, `12-press-releases.md`) |
 | `notebooks/03_eda.ipynb` | EDA (label distribution, feature tests, correlations, temporal) |
 
 ## Key decisions
@@ -58,6 +61,7 @@ python src/models/evaluate.py --data-root .                                     
   states that EPS, so it is paired with the *next* announcement (gap 63–120 days, median 90). Do not revert.
 - **Class imbalance**: ~14% misses. Use `ds.get_class_weights()`; judge on F1/AUC, not accuracy.
 - **Truncation**: MD&A is 5k–20k tokens; FinBERT sees the first 512 unless `--max-chunks` > 1. MiniLM embeddings always cover the whole filing.
+- **Press-release pairing**: releases are filed *on* announcement day and state its EPS; `min_transcript_gap_days=30` stops a release pairing with its own result (without it 3 samples leaked). Do not remove.
 - **Model selection**: by val AUC (never test); compare models with `evaluate.py` (rolling-origin + paired bootstrap).
 
 ## Current results
@@ -86,7 +90,16 @@ Temporal split, test = 2025–2026 (169 samples, 23 misses), 2026-10-22:
 history+PCA-16 0.708 (ΔAUC vs history +0.016 [−0.021, +0.053], P(Δ>0)=0.80), swept fusion 0.705. Per-year AUC
 swings ±0.05 and rankings flip. Top-10% watch-list precision ~38–40% vs 14% base. Val-tuned threshold hurts F1
 vs 0.5. **Company-held-out: embed AUC 0.673 → 0.481 (chance)**, history 0.703 → 0.681 — the text embedding
-mostly encodes company identity; no transferable text signal.
+mostly encodes company identity; no transferable text signal. **Within-company text (2026-10-27):** resid 0.494 /
+delta 0.506 pooled (chance), adding them to history −0.014 / −0.019, unseen companies 0.51 / 0.44 → MD&A has no
+next-quarter signal once identity is removed.
+
+**Press releases (8-K Ex. 99.1, 2026-10-27, `evaluate.py --text press`):** 1,848 samples / 251 misses
+(2017–26); pooled test 738 / 100 misses. history 0.653, embed 0.603, history+embed_pca16 0.676 (Δ +0.023
+[−0.023, +0.066], P=0.84; ahead in all 3 folds), swept fusion 0.679 (Δ +0.026, P=0.86), resid 0.542, delta
+0.502 (within-company: no signal). Unseen companies: embed 0.717 → **0.580** (MD&A 0.481), history+embed
+0.661 vs history 0.646. → Some transferable signal, but not significant over history. Fails the bar.
+History is lower on these rows than on MD&A rows (0.653 vs 0.693); compare within one table only.
 
 Takeaways: frozen text features + small model beat end-to-end FinBERT (too little data). Full-text
 embedding is the best text representation, but its signal is company identity; history drives the
@@ -95,9 +108,9 @@ signal. Neural late fusion > early fusion on val but < LR history+PCA-16; MLP un
 
 ## Open issues / next steps
 
-0. Day-2 learning plan in progress (user wants concept → code → explanation, one task at a time, wait for "ready"): Task 1 LoRA done (A: 512 tokens, B: whole-filing chunks); Task 2 fusion model + manual loop done; Task 3 W&B sweep, Task 4 evaluation deep dive done; Task 5 HF Hub done (public); Task 6 docs done (doc 04 LoRA/chunking, overview journey + headline, README). Day-2 plan complete.
+0. Day-2 learning plan in progress (user wants concept → code → explanation, one task at a time, wait for "ready"): Task 1 LoRA done (A: 512 tokens, B: whole-filing chunks); Task 2 fusion model + manual loop done; Task 3 W&B sweep, Task 4 evaluation deep dive done; Task 5 HF Hub done (public); Task 6 docs done. Day-2 plan complete. Day-3 (same style): step 1 within-company MD&A check done (null); step 2 = 8-K press releases done (some transferable signal, not significant over history; docs/12). Next: user decides (targeted press-release features e.g. guidance raised/cut via LLM or rules; or MD&A+press combined on shared rows).
 1. Evaluate new models with `evaluate.py` (rolling-origin + paired bootstrap), not the single 23-miss window.
-2. More/better text: only 661 samples. 8-K earnings press releases (Ex. 99.1) or call transcripts.
+2. More/better text: press releases done (1,848 samples). Call transcripts would be next but have no free source.
 3. Optional LLM-scored features (hedging, outlook tone, new risks, guidance specificity) — needs Anthropic API key, a few $ per run.
 4. Done: text signal is company identity (embed → chance on unseen companies). Text features need to be within-company (vs own past filings) or forward-looking (call Q&A, 8-K guidance) to add anything.
 5. Possible upgrades: stronger embedder (e.g. bge-base), Loughran-McDonald dictionary for tone features, gradient boosting.
@@ -133,3 +146,5 @@ signal. Neural late fusion > early fusion on val but < LR history+PCA-16; MLP un
 - **2026-10-27** — Pushed to HF Hub `Guruprasath12/lie-detect` (private); verified `from_pretrained` from the Hub with the downloaded `fusion_net.py`.
 - **2026-10-27** — Task 6 docs: `04` gained LoRA, chunking, grad-accum + class-weight bug, FinBERT results; `00` new pipeline diagram, "where we are" (answer, 8-step journey, pooled headline table), next steps, glossary; `05` caveats point to Task 4 findings; new GitHub `README.md`; `requirements.txt` adds huggingface_hub, safetensors.
 - **2026-10-27** — Made HF repo `Guruprasath12/lie-detect` public (anonymous download verified); README links it.
+- **2026-10-27** — Day-3 step 1: `within_company_embeddings` in `text_features.py`; `evaluate.py` generic `make_blocks` (blocks `history|embed|resid|delta` + `_pcaN`; renamed `history+pca16` → `history+embed_pca16`), company-held-out C now from fold 2025-26 (same values as before). resid/delta at chance (0.494/0.506), hurt when added to history. Old models unchanged. Docs 07, 10 §5, 00 updated.
+- **2026-10-27** — Day-3 step 2: `src/data/press_releases.py` (8-K Item 2.02 EX-99.1, 2,115 releases, ~50 min); `dataset.py` `min_transcript_gap_days` (30 for press: without it 3 samples paired a release with its own result); `baselines.TEXT_SOURCES` + `build_table(text=)`; `evaluate.py --text press` → `evaluation_press.json`. 1,848 samples. history+embed +0.023 (P 0.84, n.s.), embed 0.58 on unseen companies (MD&A 0.48); resid/delta no signal. MD&A results unchanged. Added `docs/12-press-releases.md`; updated 00, 10, README.

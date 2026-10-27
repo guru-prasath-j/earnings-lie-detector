@@ -91,13 +91,36 @@ transfers to new companies because "missed last quarter" means the same thing ev
 It also explains question 2: text adds little on top of history because both mostly encode the
 company's track record.
 
+## 5. Within-company text: is there *any* language signal? (2026-10-27)
+
+If the embedding mostly encodes company identity, remove the identity and see what's left
+(`text_features.within_company_embeddings`):
+
+- **`resid`**: this filing's embedding minus the mean of the same company's **earlier** filings, i.e. how
+  this quarter's language differs from the company's usual language
+- **`delta`**: this filing's embedding minus the company's previous filing, i.e. what changed since last quarter
+
+Both use only the past (a company's first filing gets 0). Evaluated exactly like the models above:
+
+| Model | Pooled AUC | ΔAUC vs history [95%] | Unseen companies |
+|---|---|---|---|
+| resid alone | 0.494 | −0.199 | 0.507 |
+| delta alone | 0.506 | −0.186 | 0.444 |
+| history + resid PCA-16 | 0.679 | −0.014 [−0.058, +0.033] | 0.685 |
+| history + delta PCA-16 | 0.674 | −0.019 [−0.051, +0.012] | 0.679 |
+| *history alone* | *0.693* | — | *0.681* |
+
+**Chance on their own, and slightly worse than history when added.** Once the company's usual style is
+removed, nothing in the MD&A embedding predicts the next quarter's miss. This matches the "did they rewrite
+the report?" change scores in [07](07-text-features.md), which also found nothing. The 10-Q MD&A,
+represented this way, has no transferable signal for next-quarter EPS misses.
+
 ## What this means for the project
 
 1. **The honest headline:** about 0.70 AUC pooled over 2023–26, driven by the company's own earnings history.
    A 10% watch-list is ~40% precise.
-2. **MD&A embeddings carry no transferable "lie detector" signal.** What they carry is company identity.
-   To find real language signal, features must be *within-company*: how this filing differs from the
-   same company's earlier ones (our change features tried that and found nothing), or text where
-   management talks about the coming quarter (earnings-call Q&A, guidance in 8-K press releases).
+2. **MD&A embeddings carry no transferable "lie detector" signal.** Across companies they carry identity;
+   within a company (section 5) they carry nothing. Earnings press releases do slightly better
+   (0.58 on unseen companies, +0.023 over history, not significant): see [12](12-press-releases.md).
 3. **Evaluate with rolling-origin + paired bootstrap from now on.** A single 23-miss window can't
    separate models that differ by 0.02.
