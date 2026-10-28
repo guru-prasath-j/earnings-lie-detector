@@ -1,6 +1,6 @@
 # 12 — Earnings press releases (8-K, Exhibit 99.1)
 
-**Files:** `src/data/press_releases.py` (scraper), `evaluate.py --text press` → `checkpoints/evaluation_press.json`
+**Files:** `src/data/press_releases.py` (scraper), `src/models/llm_guidance.py` (step 4), `evaluate.py --text press` → `checkpoints/evaluation_press.json`
 
 ## Why press releases
 
@@ -150,3 +150,86 @@ once, so it has 2.5× the evidence of the rolling-origin test.
 **Bottom line:** the first text feature that carries real, transferable signal is *what management
 says about guidance*, not how the text "feels" overall. It adds about +0.02–0.04 AUC on top of history,
 significant on unseen companies, suggestive over time.
+
+## Step 4: LLM-scored guidance (2026-10-28)
+
+The rules know the *direction* of a guidance change, but not its *size*, whether it is about EPS or
+revenue, or the tone around it. Step 4 asks an LLM instead (`src/models/llm_guidance.py`).
+
+### How it works
+
+1. **Only the outlook passage is sent.** Sentences mentioning guidance / outlook / forecast (minus
+   boilerplate) plus two neighbours on each side, at most 6,000 characters. 1,376 of 2,115 releases have
+   one; the rest are cached as "no outlook" without a call.
+2. **A fixed JSON schema**, temperature 0: `eps_guidance` and `revenue_guidance` (raised / lowered /
+   maintained / initiated / given / withdrawn / not_mentioned), `eps_change_pct` and
+   `revenue_change_pct` (change of the midpoint), `horizon`, `outlook_tone` (−2 to 2), `headwinds`,
+   `specificity` (0 none, 1 qualitative, 2 numbers). The prompt spells out edge cases: "raised" only if
+   the text compares with a previous figure, "given" when figures are stated without a comparison,
+   segment / margin / tax-rate guidance doesn't count.
+3. **Nine numeric features** per release (`LLM_COLS`): has guidance, EPS direction (+1 / −1), EPS
+   withdrawn, EPS change % (clipped to ±20), revenue direction and change, tone, headwinds,
+   specificity. `build_table(text="press")` adds them when the cache exists.
+
+**The API:** NVIDIA's free, OpenAI-compatible endpoint (`integrate.api.nvidia.com`) with
+`openai/gpt-oss-20b`. Llama 3.3 70B had been retired (HTTP 410), and several other listed models
+returned 404 or unparseable output. The key is read from `~/personal/.secrets/nvidia.env`, never printed.
+
+**Engineering lessons:**
+
+- **Cache every answer** (`data/processed/llm_guidance.jsonl`, one JSON line per release) so a crash or
+  restart resumes. `--retry-failed` re-scores the failures.
+- **Test on 20 releases first** and read the answers. The first prompt overused "initiated" and gave a
+  revenue change of 33% for a growth rate moving from 3% to 4%. Adding "given" and the percentage-point
+  rule fixed both.
+- **Free tiers queue.** Calls took 16 s at first and 90–250 s under load. A 120 s client timeout threw
+  away a quarter of the calls; 300 s and 16 parallel workers fixed it. The whole run took ~4 hours.
+- **Don't retry permanent errors** (4xx other than 429).
+
+Result: 1,367 releases scored, 6 failed after retries (unparseable answers, treated as "no guidance"),
+738 with no outlook passage.
+
+### Simple tables first
+
+| Next-quarter miss rate (base 13.6%) | n | Miss rate |
+|---|---|---|
+| EPS guidance raised | 217 | 6.9% |
+| EPS raised by ≥ 3% | 31 | **0%** |
+| EPS raised by < 3% | 186 | 8.1% |
+| EPS guidance lowered | 27 | 11.1% |
+| Revenue guidance raised | 169 | 5.3% |
+| Tone confident (+1 / +2) | 399 / 211 | 8.3% / 6.6% |
+| Tone neutral or cautious (0 / −1 / −2) | 1,082 / 111 / 45 | 16.5% / 17.1% / 13.3% |
+| Numeric guidance | 722 | 8.6% |
+| No guidance | 976 | 17.7% |
+
+The size of a raise matters (no misses after a raise of 3% or more). But "lowered" is *weaker* than the
+rules' "cut" (11% vs 44%): the LLM finds more cuts (27 vs 16), and the extra ones are milder. The rules
+only fire on blunt sentences, which turn out to be the alarming ones.
+
+Rules and LLM mostly agree on direction: 190 releases both call a raise, 8 both call a cut. The LLM adds
+82 raises and 23 cuts the rules missed, and sees no EPS or revenue change in 35 of the rule raises
+(likely segment, margin or cash-flow guidance, which the schema excludes; not checked one by one).
+
+### Results
+
+| Model | Rolling-origin pooled AUC | Δ vs history [95%], P(Δ>0) | Unseen companies | Δ vs history [95%], P(Δ>0) |
+|---|---|---|---|---|
+| history | 0.653 | — | 0.646 | — |
+| guidance (rules) | 0.581 | | 0.606 | |
+| llm | 0.585 | | 0.597 | |
+| history + guidance (rules) | 0.667 | +0.014 [−0.038, +0.064], 0.68 | 0.679 | **+0.033 [+0.004, +0.062], 0.99** |
+| history + llm | 0.665 | +0.012 [−0.039, +0.063], 0.67 | 0.671 | +0.025 [−0.006, +0.055], 0.94 |
+| history + guidance + llm | 0.669 | +0.016 [−0.039, +0.070], 0.69 | 0.665 | +0.020 [−0.013, +0.051], 0.88 |
+| history + llm + embed PCA-16 | 0.679 | +0.026 [−0.028, +0.078], 0.84 | 0.682 | **+0.037 [+0.001, +0.071], 0.98** |
+
+- **The LLM matches the rules; it doesn't beat them.** Alone 0.585 vs 0.581; with history 0.665 vs 0.667.
+- **Combining both adds nothing**: the two read the same sentences, so they carry the same information.
+- **The LLM's extra detail (size, EPS vs revenue, tone) doesn't show up in AUC.** Large raises are rare
+  (31), and logistic regression on nine features with ~250 misses can't exploit them.
+
+### What this means
+
+Guidance is the signal, and simple rules already capture it. An LLM costs ~4 hours of API time (free
+here; a few dollars on a paid API) for the same result. That is a useful finding: the bottleneck is the
+number of misses to learn from, not the quality of the extraction.

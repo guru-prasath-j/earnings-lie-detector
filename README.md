@@ -25,6 +25,9 @@ about 90 days later.
   maintained / withdrawn guidance. Added to history, they give the project's first significant gain:
   +0.033 AUC on unseen companies (95% interval [+0.004, +0.062]). Over time the gain is +0.01–0.03 and
   not significant. Releases that cut guidance precede a miss 44% of the time, raises only 6%.
+- **An LLM reading the guidance does no better than the rules.** `gpt-oss-20b` (free NVIDIA API) scores
+  EPS / revenue direction, size and tone for 1,367 releases: +0.025 on unseen companies (P 0.94) vs the
+  rules' +0.033. The bottleneck is the number of misses, not the extraction.
 - **Reading the whole document matters more than fine-tuning.** FinBERT on the first 512 tokens scores
   at chance. Reading 16 chunks of the filing lifts it to 0.60, and LoRA fine-tuning adds nothing on top.
   A frozen MiniLM embedding of the full text with logistic regression does better (0.70 on 2025–26).
@@ -56,6 +59,7 @@ python src/models/baselines.py --data-root .                       # logistic-re
 python src/models/fusion.py --data-root .                          # neural fusion, 5 seeds, ~5 s
 python src/models/evaluate.py --data-root .                        # multi-year evaluation, ~1 min
 python src/data/press_releases.py                                  # 8-K earnings press releases, ~50 min
+python src/models/llm_guidance.py                                  # optional: LLM guidance scores (NVIDIA key), hours
 python src/models/evaluate.py --data-root . --text press           # same evaluation on press releases
 python src/models/train.py --data-root . --freeze-encoder          # FinBERT, ~7 min on a laptop GPU
 ```

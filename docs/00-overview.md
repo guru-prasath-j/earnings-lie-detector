@@ -73,7 +73,7 @@ MD&A and predicts **miss (1)** vs **met/beat (0)** for the company's next earnin
    86% accurate and useless, so we ignore accuracy and use **F1** and **AUC**, and weight the loss so
    misses count more. → [05-evaluation-and-baselines.md](05-evaluation-and-baselines.md)
 
-## Where we are (2026-10-27)
+## Where we are (2026-10-28)
 
 ### The answer so far
 
@@ -86,6 +86,8 @@ drops to chance. What the text "knows" is mostly *which company* wrote it.
 **The exception is guidance.** Whether management raised, cut, kept or withdrew its outlook, read with
 simple rules, adds +0.03 AUC on top of history for companies the model has never seen, the first
 significant gain from text ([12](12-press-releases.md)). Not *how* they write, but *what they commit to*.
+An LLM reading the same passages does no better than the rules: the limit is the number of misses to
+learn from, not the quality of the extraction.
 
 ### The journey (each step has its own doc)
 
@@ -102,6 +104,7 @@ significant gain from text ([12](12-press-releases.md)). Not *how* they write, b
 | 9 | Text with company identity removed (vs own past filings) | Chance (0.49–0.51); MD&A has no next-quarter signal | [10](10-evaluation-deep-dive.md) §5 |
 | 10 | Earnings press releases (2,115, 2016–26; 1,848 samples) | +0.023 over history (P=0.84, not significant), but text keeps 0.58 on unseen companies (MD&A 0.48) | [12](12-press-releases.md) |
 | 11 | Rule-based guidance features (raised / cut / maintained / withdrawn, hedging) | **First significant gain:** +0.033 over history on unseen companies (P=0.99); over time +0.014–0.028, not significant. Works from MD&A too | [12](12-press-releases.md) |
+| 12 | LLM-scored guidance (gpt-oss-20b via NVIDIA API: EPS / revenue direction and size, tone) | Same as the rules (+0.012 over time, +0.025 unseen, P 0.94); combining both adds nothing. Raises ≥ 3%: 0 misses in 31 | [12](12-press-releases.md) |
 
 ### Headline numbers (rolling-origin, test years 2023–26: 403 samples, 58 misses)
 
@@ -116,11 +119,10 @@ Base rate 14.4%. The ranges in brackets are 95% paired-bootstrap intervals; all 
 
 ## What's next
 
-1. **Better guidance extraction** ([12](12-press-releases.md)): the rules are ~85% precise and don't
-   read the size of a raise or cut, or whether it concerns EPS or revenue. An LLM could score each
-   release with a fixed schema. Combine MD&A and press-release guidance on shared rows.
-2. **More companies** (49 now, mostly large caps), so company-held-out evaluation means more.
-3. Optional: LLM-scored features (hedging, outlook tone, new risks, guidance specificity).
+1. **More companies and misses** (49 companies, ~250 misses now). Better extraction (step 12) didn't
+   help, so more data is the lever, and it makes company-held-out evaluation mean more.
+2. Combine MD&A and press-release guidance on shared rows.
+3. Refresh the Hugging Face model to history + guidance.
 
 ## Glossary
 

@@ -59,6 +59,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from baselines import HISTORY_COLS, build_table  # noqa: E402
 from fusion import train_one  # noqa: E402
 from text_features import GUIDANCE_COLS, within_company_embeddings  # noqa: E402
+from llm_guidance import LLM_COLS  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("evaluate")
@@ -76,6 +77,8 @@ LR_MODELS = [
     # rule-based outlook features: guidance raised / cut / maintained / withdrawn, hedging
     "guidance", "history+guidance", "history+guidance+embed_pca16",
 ]
+# LLM-scored guidance (llm_guidance.py; press releases only, added when the scores exist)
+LLM_MODELS = ["llm", "history+llm", "history+guidance+llm", "history+llm+embed_pca16"]
 CS = (0.001, 0.01, 0.1, 1.0, 10.0)
 # Winner of W&B sweep 0zsaf6qz (picked on the 2024 val year — mildly optimistic for the 2023/2024 folds)
 FUSION_CFG = dict(blocks=["history", "embed"], fusion="late", epochs=200, patience=20,
@@ -185,8 +188,9 @@ def main() -> None:
     resid, delta = within_company_embeddings(df, emb_cols)
     df = pd.concat([df, resid, delta], axis=1)
     cols = {"history": HISTORY_COLS, "embed": emb_cols,
-            "resid": list(resid.columns), "delta": list(delta.columns), "guidance": GUIDANCE_COLS}
-    models = LR_MODELS + ([] if args.no_fusion else ["fusion_swept"])
+            "resid": list(resid.columns), "delta": list(delta.columns), "guidance": GUIDANCE_COLS, "llm": LLM_COLS}
+    lr_models = LR_MODELS + (LLM_MODELS if set(LLM_COLS) <= set(df.columns) else [])
+    models = lr_models + ([] if args.no_fusion else ["fusion_swept"])
     report: Dict = {"folds": {}, "pooled": {}, "company_holdout": {}}
 
     # ---- 1 + 3: rolling origin -----------------------------------------------------
@@ -238,14 +242,14 @@ def main() -> None:
     report["pooled"]["_base_rate"] = base
 
     # ---- 4: company-held-out vs random CV (LR, C as chosen on 2024 val in the 2025-26 fold) ----
-    fixed_C = {m: report["folds"]["2025-26"][m]["C"] for m in LR_MODELS}
+    fixed_C = {m: report["folds"]["2025-26"][m]["C"] for m in lr_models}
     y = df.label.to_numpy()
     splitters = {"random": StratifiedKFold(5, shuffle=True, random_state=0).split(df, y),
                  "by_company": GroupKFold(5).split(df, y, groups=df.ticker)}
     unseen_prob = {}
     for split_name, splits in splitters.items():
         splits = list(splits)
-        for m in LR_MODELS:
+        for m in lr_models:
             prob = np.zeros(len(df))
             for tr_i, te_i in splits:
                 tr, te = df.iloc[tr_i], df.iloc[te_i]

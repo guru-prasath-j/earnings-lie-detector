@@ -5,6 +5,7 @@ transformers
 datasets
 peft
 huggingface_hub
+openai            # NVIDIA API client (llm_guidance.py)
 safetensors
 accelerate
 bitsandbytes

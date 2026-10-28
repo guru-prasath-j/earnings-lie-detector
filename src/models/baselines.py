@@ -43,6 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "data"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from dataset import EarningsCallDataset  # noqa: E402
 from text_features import CHANGE_COLS, GUIDANCE_COLS, change_features, document_embeddings, guidance_features  # noqa: E402
+from llm_guidance import LLM_COLS, llm_features  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("baselines")
@@ -51,8 +52,9 @@ HISTORY_COLS = ["prev_miss", "prev_surprise", "miss_rate_4q", "mean_surprise_4q"
 
 # Text sources: folder of {TICKER}.json, embedding cache, min days between text and the label it predicts
 TEXT_SOURCES = {
-    "mda": {"dir": "data/raw/transcripts", "cache": "embeddings_minilm.npz", "min_gap": 0},          # 10-Q MD&A
-    "press": {"dir": "data/raw/press_releases", "cache": "embeddings_minilm_press.npz", "min_gap": 30},  # 8-K EX-99.1
+    "mda": {"dir": "data/raw/transcripts", "cache": "embeddings_minilm.npz", "min_gap": 0, "llm": None},  # 10-Q MD&A
+    "press": {"dir": "data/raw/press_releases", "cache": "embeddings_minilm_press.npz", "min_gap": 30,      # 8-K EX-99.1
+              "llm": "data/processed/llm_guidance.jsonl"},  # LLM-scored guidance (llm_guidance.py), if run
 }
 
 
@@ -148,6 +150,12 @@ def build_table(data_root: str, text: str = "mda") -> Tuple[pd.DataFrame, List[s
     emb = document_embeddings({k: ds.transcripts[k] for k in used},
                               root / "data" / "processed" / src["cache"])
     emb_cols = [f"emb_{i}" for i in range(len(next(iter(emb.values()))))]
+    llm = None
+    if src["llm"] and (root / src["llm"]).exists():
+        llm = llm_features(root / src["llm"])
+        missing = len(used - set(llm.index))
+        if missing:
+            logger.warning("%d of %d documents have no LLM score (treated as no guidance)", missing, len(used))
 
     rows = []
     for s in ds.samples:
@@ -160,6 +168,7 @@ def build_table(data_root: str, text: str = "mda") -> Tuple[pd.DataFrame, List[s
             **hist.loc[(s["ticker"], s["date"])].to_dict(),
             **change.loc[tk].to_dict(),
             **guidance.loc[tk].to_dict(),
+            **({c: float(llm.at[tk, c]) if tk in llm.index else 0.0 for c in LLM_COLS} if llm is not None else {}),
             **dict(zip(emb_cols, emb[tk])),
         })
     return pd.DataFrame(rows), emb_cols
