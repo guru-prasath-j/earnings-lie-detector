@@ -154,7 +154,10 @@ def build_table(data_root: str, text: str = "mda") -> Tuple[pd.DataFrame, List[s
     if src["llm"] and (root / src["llm"]).exists():
         llm = llm_features(root / src["llm"])
         missing = len(used - set(llm.index))
-        if missing:
+        if missing > 0.01 * len(used):  # e.g. new companies not scored yet: zeros would read as "no guidance"
+            logger.warning("%d of %d documents have no LLM score → LLM columns left out", missing, len(used))
+            llm = None
+        elif missing:
             logger.warning("%d of %d documents have no LLM score (treated as no guidance)", missing, len(used))
 
     rows = []

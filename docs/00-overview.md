@@ -22,12 +22,14 @@ MD&A and predicts **miss (1)** vs **met/beat (0)** for the company's next earnin
 ## The pipeline at a glance
 
 ```
- SEC EDGAR ──scraper.py──▶ data/raw/transcripts/{TICKER}.json      (664 MD&A texts, 49 companies, 2020–2026)
- yfinance  ──labeler.py──▶ data/processed/labels.csv               (1,899 announcements: EPS actual vs estimate)
+ universe.py ─▶ data/universe.csv                                  (49 original + 140 S&P 500 companies by sector)
+ SEC EDGAR ──scraper.py──▶ data/raw/transcripts/{TICKER}.json      (3,193 MD&A texts, 2020–2025)
+           ──press_releases.py──▶ data/raw/press_releases/          (8,313 earnings releases, 2016–2026)
+ yfinance  ──labeler.py──▶ data/processed/labels.csv               (7,089 announcements: EPS actual vs estimate)
                                    │
                          dataset.py │ pairs each filing with the NEXT announcement after it
                                    ▼
-                         661 (text, label) samples, 92 misses (14%)
+              MD&A: 2,983 samples, 545 misses · press: 6,916 samples, 1,161 misses (17%)
                                    │
         ┌──────────────────────────┼─────────────────────────────┐
         ▼                          ▼                             ▼
@@ -56,7 +58,8 @@ MD&A and predicts **miss (1)** vs **met/beat (0)** for the company's next earnin
 | 8. Hyperparameter sweep (W&B) | `src/models/sweep.py` | [09-wandb-sweeps.md](09-wandb-sweeps.md) |
 | 9. Evaluation deep dive (multi-year, paired bootstrap, unseen companies) | `src/models/evaluate.py` | [10-evaluation-deep-dive.md](10-evaluation-deep-dive.md) |
 | 10. Publish to the Hugging Face Hub | `src/models/fusion_net.py`, `push_to_hub.py` | [11-huggingface-hub.md](11-huggingface-hub.md) |
-| 11. Earnings press releases (8-K Ex. 99.1) as a second text source | `src/data/press_releases.py`, `evaluate.py --text press` | [12-press-releases.md](12-press-releases.md) |
+| 11. Earnings press releases (8-K Ex. 99.1) as a second text source; guidance rules and LLM scores | `src/data/press_releases.py`, `evaluate.py --text press`, `llm_guidance.py` | [12-press-releases.md](12-press-releases.md) |
+| 12. More companies (49 → 188) and a sector baseline | `src/data/universe.py`, `evaluate.py --companies` | [13-more-companies.md](13-more-companies.md) |
 | (optional) Audio | `src/data/audio_*.py` | [06-audio-pipeline.md](06-audio-pipeline.md) |
 
 ## Three ideas that matter most
@@ -73,21 +76,21 @@ MD&A and predicts **miss (1)** vs **met/beat (0)** for the company's next earnin
    86% accurate and useless, so we ignore accuracy and use **F1** and **AUC**, and weight the loss so
    misses count more. → [05-evaluation-and-baselines.md](05-evaluation-and-baselines.md)
 
-## Where we are (2026-10-28)
+## Where we are (2026-10-29)
 
 ### The answer so far
 
-**Partly yes, but not because of the language.** The best models rank upcoming misses clearly better
-than chance (AUC ≈ 0.70 over 2023–26), and flagging the riskiest 10% of announcements finds misses at
-**~2.7× the base rate**. That signal comes from the company's **own earnings track record**. The MD&A
-text adds at most a few hundredths of AUC, and on companies the model hasn't seen, a text-only model
-drops to chance. What the text "knows" is mostly *which company* wrote it.
+**Partly yes, but not because of the language.** Models rank upcoming misses clearly better than chance
+(AUC ≈ 0.67 on 188 companies over 2023–26; flagging the riskiest 10% finds misses at ~2× the base rate).
+That signal comes from the company's **own earnings track record and its sector**. The text, whether 10-Q
+MD&A or earnings press release, read as an embedding, with guidance rules or by an LLM, adds at most
++0.006 AUC on top of history + sector, not significantly different from zero.
 
-**The exception is guidance.** Whether management raised, cut, kept or withdrew its outlook, read with
-simple rules, adds +0.03 AUC on top of history for companies the model has never seen, the first
-significant gain from text ([12](12-press-releases.md)). Not *how* they write, but *what they commit to*.
-An LLM reading the same passages does no better than the rules: the limit is the number of misses to
-learn from, not the quality of the extraction.
+With 49 companies, guidance had looked like the exception (+0.033 on unseen companies). Scaling to 188
+companies ([13](13-more-companies.md)) showed that most of that gain was luck plus a hidden **sector**
+effect: whether a company publishes an outlook at all depends on its industry. Guidance *direction*
+still means something (miss rate 11% after a raise, 28% after a cut, 17% base), but history already
+carries most of it.
 
 ### The journey (each step has its own doc)
 
@@ -105,8 +108,20 @@ learn from, not the quality of the extraction.
 | 10 | Earnings press releases (2,115, 2016–26; 1,848 samples) | +0.023 over history (P=0.84, not significant), but text keeps 0.58 on unseen companies (MD&A 0.48) | [12](12-press-releases.md) |
 | 11 | Rule-based guidance features (raised / cut / maintained / withdrawn, hedging) | **First significant gain:** +0.033 over history on unseen companies (P=0.99); over time +0.014–0.028, not significant. Works from MD&A too | [12](12-press-releases.md) |
 | 12 | LLM-scored guidance (gpt-oss-20b via NVIDIA API: EPS / revenue direction and size, tone) | Same as the rules (+0.012 over time, +0.025 unseen, P 0.94); combining both adds nothing. Raises ≥ 3%: 0 misses in 31 | [12](12-press-releases.md) |
+| 13 | 4× the companies (49 → 188, S&P 500 by sector; REITs excluded) and a sector baseline | Intervals ±0.05 → ±0.02. Guidance gain shrinks to +0.012 and is mostly sector; text over history + sector ≤ +0.006, n.s. | [13](13-more-companies.md) |
 
-### Headline numbers (rolling-origin, test years 2023–26: 403 samples, 58 misses)
+### Headline numbers, 188 companies (press releases, rolling-origin test 2023–26: 2,816 samples, 469 misses)
+
+| Model | Pooled AUC | vs history alone | Unseen companies vs history |
+|---|---|---|---|
+| Past surprises only | 0.655 | — | — |
+| + sector | 0.670 | +0.015 [−0.002, +0.033] | +0.015 [+0.004, +0.025] |
+| + sector + guidance rules | **0.676** | +0.021 [+0.002, +0.041] | +0.018 [+0.006, +0.031] |
+| Guidance on top of history + sector | | +0.006 [−0.004, +0.017] | +0.004 [−0.003, +0.011] |
+
+Base rate 16.7%. Brackets are 95% paired-bootstrap intervals.
+
+### Earlier headline, 49 companies (MD&A, 403 test samples, 58 misses)
 
 | Model | Pooled AUC | vs history alone | Precision in top 10% |
 |---|---|---|---|
@@ -115,14 +130,15 @@ learn from, not the quality of the extraction.
 | Past surprises + embedding PCA-16 | **0.708** | +0.016 [−0.02, +0.05] | 40% |
 | Neural late fusion (swept) | 0.705 | +0.012 [−0.05, +0.08] | 38% |
 
-Base rate 14.4%. The ranges in brackets are 95% paired-bootstrap intervals; all of them include 0.
+Base rate 14.4%. All intervals include 0; with 5× fewer misses they are 2.5× wider than above.
 
 ## What's next
 
-1. **More companies and misses** (49 companies, ~250 misses now). Better extraction (step 12) didn't
-   help, so more data is the lever, and it makes company-held-out evaluation mean more.
-2. Combine MD&A and press-release guidance on shared rows.
-3. Refresh the Hugging Face model to history + guidance.
+1. **Refresh the Hugging Face model** to the honest best: history + sector (+ guidance), trained on 188 companies.
+2. **Better history features** are where the signal is: analyst-revision trends, estimate dispersion,
+   the number of analysts (needs a data source beyond Yahoo's EPS table).
+3. Text with a different kind of information: earnings-call Q&A (no free source) rather than more
+   ways of reading the same press release.
 
 ## Glossary
 

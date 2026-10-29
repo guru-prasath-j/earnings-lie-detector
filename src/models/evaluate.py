@@ -57,6 +57,8 @@ from sklearn.preprocessing import StandardScaler
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from baselines import HISTORY_COLS, build_table  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "data"))
+from universe import load_sectors, load_universe  # noqa: E402
 from fusion import train_one  # noqa: E402
 from text_features import GUIDANCE_COLS, within_company_embeddings  # noqa: E402
 from llm_guidance import LLM_COLS  # noqa: E402
@@ -77,6 +79,10 @@ LR_MODELS = [
     # rule-based outlook features: guidance raised / cut / maintained / withdrawn, hedging
     "guidance", "history+guidance", "history+guidance+embed_pca16",
 ]
+# Sector baseline (one-hot GICS sector): with 11 sectors, "which kind of company" carries base-rate
+# information that text could pick up too. Text has to beat history+sector, not just history.
+SECTOR_MODELS = ["sector", "history+sector", "history+sector+guidance", "history+sector+embed_pca16",
+                 "history+sector+guidance+embed_pca16"]
 # LLM-scored guidance (llm_guidance.py; press releases only, added when the scores exist)
 LLM_MODELS = ["llm", "history+llm", "history+guidance+llm", "history+llm+embed_pca16"]
 CS = (0.001, 0.01, 0.1, 1.0, 10.0)
@@ -179,17 +185,23 @@ def main() -> None:
                    help="mda = 10-Q MD&A; press = 8-K earnings press releases (src/data/press_releases.py)")
     p.add_argument("--output", default=None, help="default checkpoints/evaluation.json (mda) / evaluation_press.json")
     p.add_argument("--no-fusion", action="store_true", help="Skip the neural model (LR only)")
+    p.add_argument("--companies", default="all", choices=["all", "original", "expansion"],
+                   help="restrict to a batch of data/universe.csv (original = the first 50 tickers)")
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    args.output = args.output or ("checkpoints/evaluation.json" if args.text == "mda"
-                                  else f"checkpoints/evaluation_{args.text}.json")
+    suffix = ("" if args.text == "mda" else f"_{args.text}") + ("" if args.companies == "all" else f"_{args.companies}")
+    args.output = args.output or f"checkpoints/evaluation{suffix}.json"
     df, emb_cols = build_table(args.data_root, text=args.text)
+    if args.companies != "all":
+        df = df[df.ticker.isin(load_universe(args.companies))].reset_index(drop=True)
+    logger.info("%d samples, %d misses, %d companies", len(df), int(df.label.sum()), df.ticker.nunique())
     resid, delta = within_company_embeddings(df, emb_cols)
-    df = pd.concat([df, resid, delta], axis=1)
-    cols = {"history": HISTORY_COLS, "embed": emb_cols,
-            "resid": list(resid.columns), "delta": list(delta.columns), "guidance": GUIDANCE_COLS, "llm": LLM_COLS}
-    lr_models = LR_MODELS + (LLM_MODELS if set(LLM_COLS) <= set(df.columns) else [])
+    sector = pd.get_dummies(df.ticker.map(load_sectors()), prefix="sec", dtype=float)
+    df = pd.concat([df, resid, delta, sector], axis=1)
+    cols = {"history": HISTORY_COLS, "embed": emb_cols, "resid": list(resid.columns), "delta": list(delta.columns),
+            "guidance": GUIDANCE_COLS, "llm": LLM_COLS, "sector": list(sector.columns)}
+    lr_models = LR_MODELS + SECTOR_MODELS + (LLM_MODELS if set(LLM_COLS) <= set(df.columns) else [])
     models = lr_models + ([] if args.no_fusion else ["fusion_swept"])
     report: Dict = {"folds": {}, "pooled": {}, "company_holdout": {}}
 
@@ -224,6 +236,8 @@ def main() -> None:
     y_all = np.concatenate(pooled[models[0]]["y"])
     p_all = {m: np.concatenate(pooled[m]["p"]) for m in models}
     boot = bootstrap(y_all, p_all, ref="history")
+    sector_models = [m for m in models if "sector" in m]
+    boot_sec = bootstrap(y_all, {m: p_all[m] for m in sector_models}, ref="history+sector")
     for m in models:
         pred_t = np.concatenate(pooled[m]["pred_tuned"])
         n_flag, n_hit = map(sum, zip(*top10[m]))
@@ -237,6 +251,7 @@ def main() -> None:
             "recall@tuned": float(pred_t[y_all == 1].mean()),
             "prec_top10": n_hit / n_flag, "top10_hits": f"{n_hit}/{n_flag}",
             **boot[m],
+            **({"vs_history+sector": boot_sec[m]} if m in boot_sec else {}),
         }
     base = float(y_all.mean())
     report["pooled"]["_base_rate"] = base
@@ -263,26 +278,35 @@ def main() -> None:
     for m, r in bootstrap(y, unseen_prob, ref="history").items():
         report["company_holdout"][m]["by_company_delta_ci95"] = r["delta_ci95"]
         report["company_holdout"][m]["by_company_p_delta_gt_0"] = r["p_delta_gt_0"]
+    for m, r in bootstrap(y, {m: unseen_prob[m] for m in sector_models}, ref="history+sector").items():
+        report["company_holdout"][m]["vs_history+sector"] = r
 
     # ---- print ----------------------------------------------------------------------
     logger.info("=" * 78)
     logger.info("POOLED rolling-origin test, %d samples / %d misses (base rate %.3f)",
                 len(y_all), int(y_all.sum()), base)
-    logger.info("%-28s %6s %8s %8s %6s %7s %7s %10s  %s", "model", "AUC", "AUC 95%", "", "AP",
+    logger.info("%-36s %6s %8s %8s %6s %7s %7s %10s  %s", "model", "AUC", "AUC 95%", "", "AP",
                 "F1@.5", "F1@val", "top10%", "ΔAUC vs history [95%]  P(Δ>0)")
     for m in models:
         r = report["pooled"][m]
         lo, hi = r["auc_ci95"]
         dlo, dhi = r["delta_ci95"]
-        logger.info("%-28s %6.3f %8.2f–%.2f %6.3f %7.3f %7.3f %5.2f (%s)  %+.3f [%+.3f, %+.3f]  %.2f",
+        logger.info("%-36s %6.3f %8.2f–%.2f %6.3f %7.3f %7.3f %5.2f (%s)  %+.3f [%+.3f, %+.3f]  %.2f",
                     m, r["auc"], lo, hi, r["avg_precision"], r["f1@0.5"], r["f1@tuned"],
                     r["prec_top10"], r["top10_hits"], r["delta_vs_history"], dlo, dhi, r["p_delta_gt_0"])
     logger.info("Company-held-out (5-fold CV, all years; AUC random → by company; by-company ΔAUC vs history):")
     for m, r in report["company_holdout"].items():
         dlo, dhi = r["by_company_delta_ci95"]
-        logger.info("  %-28s %.3f → %.3f  %+.3f [%+.3f, %+.3f]  P(Δ>0)=%.2f", m, r["random"], r["by_company"],
+        logger.info("  %-36s %.3f → %.3f  %+.3f [%+.3f, %+.3f]  P(Δ>0)=%.2f", m, r["random"], r["by_company"],
                     r["by_company"] - report["company_holdout"]["history"]["by_company"], dlo, dhi,
                     r["by_company_p_delta_gt_0"])
+
+    logger.info("Sector-adjusted: ΔAUC vs history+sector [95%%], P(Δ>0) — pooled rolling-origin | unseen companies")
+    for m in sector_models:
+        a, b = report["pooled"][m]["vs_history+sector"], report["company_holdout"][m]["vs_history+sector"]
+        logger.info("  %-36s %+.3f [%+.3f, %+.3f] %.2f | %+.3f [%+.3f, %+.3f] %.2f", m,
+                    a["delta_vs_history+sector"], *a["delta_ci95"], a["p_delta_gt_0"],
+                    b["delta_vs_history+sector"], *b["delta_ci95"], b["p_delta_gt_0"])
 
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)

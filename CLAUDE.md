@@ -1,7 +1,8 @@
 # Earnings Lie Detector — project context
 
 Predict whether a company will **miss its next earnings EPS estimate** (label 1) or meet/beat it (label 0)
-from the MD&A section of its SEC 10-Q filings. Text-only for now; audio is optional and off.
+from the MD&A section of its SEC 10-Q filings and its 8-K earnings press releases. 188 companies since
+2026-10-29 (49 original + 139 S&P 500 by sector, REITs excluded). Text-only; audio is optional and off.
 
 ## Keep this file current (standing instruction)
 
@@ -10,7 +11,7 @@ scripts, a pipeline run, training results, a design decision, a new known issue 
 section below and the **Log** at the bottom (date, what changed, results). Keep it short and factual;
 replace stale info rather than appending contradictions. Commit it together with the code it describes.
 
-Learning docs live in `docs/` (`00-overview.md` = high-level + project journey, `01`–`11` = one per component). `README.md` = GitHub-facing summary. The user
+Learning docs live in `docs/` (`00-overview.md` = high-level + project journey, `01`–`13` = one per component). `README.md` = GitHub-facing summary. The user
 reads them to learn — when an implementation or result changes, update the matching doc too.
 
 ## Setup on a new machine
@@ -23,15 +24,16 @@ pip install -r requirements.txt
 `data/raw/`, `data/processed/`, `*.pt` and `checkpoints/` are gitignored — regenerate them:
 
 ```bash
-python src/data/scraper.py                                         # → data/raw/transcripts/{TICKER}.json (~664 filings, 49 tickers)
-python src/data/labeler.py --transcripts-dir data/raw/transcripts  # → data/processed/labels.csv (~1,899 rows)
-python src/data/dataset.py                                         # sanity check: 661 samples, 92 misses
+T=$(python src/data/universe.py --list all)                        # data/universe.csv is committed (200 rows, 10 REITs excluded → 190)
+python src/data/scraper.py --tickers $T                            # → data/raw/transcripts/{TICKER}.json (3,193 filings), ~1.5 h
+python src/data/labeler.py --tickers $T                            # → data/processed/labels.csv (~7,100 rows; here: 1,899 original + 5,190 expansion, appended)
+python src/data/dataset.py                                         # sanity check (old 49-company numbers: 661 samples, 92 misses)
 python src/models/train.py --data-root . --freeze-encoder --epochs 10 --batch-size 8   # 5 seeds, ~7 min on RTX A1000
 python src/models/baselines.py --data-root .                                          # LR yardsticks; first run builds MiniLM cache (~1.5 min)
 python src/models/fusion.py --data-root .                                             # neural late fusion, 5 seeds, ~5 s
 python src/models/evaluate.py --data-root .                                           # rolling-origin deep dive → checkpoints/evaluation.json, ~1 min
-python src/data/press_releases.py                                                     # → data/raw/press_releases/{TICKER}.json (2,115 releases, 50 tickers), ~50 min
-python src/models/llm_guidance.py                                                    # optional, needs ~/personal/.secrets/nvidia.env → data/processed/llm_guidance.jsonl (~4 h on free tier; resumes)
+python src/data/press_releases.py --tickers $T                                        # → data/raw/press_releases/{TICKER}.json (8,313 releases), ~3 h
+python src/models/llm_guidance.py                                                    # optional, original 50 only so far (build_table drops LLM cols if >1% unscored), needs ~/personal/.secrets/nvidia.env → data/processed/llm_guidance.jsonl (~4 h on free tier; resumes)
 python src/models/evaluate.py --data-root . --text press                              # → checkpoints/evaluation_press.json (first run embeds, ~1.5 min)
 ```
 
@@ -39,6 +41,7 @@ python src/models/evaluate.py --data-root . --text press                        
 
 | File | Role |
 |---|---|
+| `src/data/universe.py` | Original 50 tickers (`scraper.get_default_tickers`) + 150 from current S&P 500 (GitHub datasets/s-and-p-500-companies), one per CIK, `.`→`-`, largest-remainder allocation by GICS sector, seed 0 → committed `data/universe.csv` (`ticker,name,sector,cik,batch,exclude`). `EXCLUDED_SECTORS` = Real Estate (REIT FFO vs GAAP EPS → 45–62% "misses"). `load_universe(batch)` (skips excluded), `load_sectors()`. `--list all|original|expansion` prints tickers |
 | `src/data/scraper.py` | SEC EDGAR 10-Q MD&A text → flat `data/raw/transcripts/{TICKER}.json` (list of records: `company`, `date`=filing date, `quarter`, `form`, `mda_text`, …) plus combined `_all_transcripts.json` |
 | `src/data/press_releases.py` | 8-K Item 2.02 earnings press releases: submissions API (all pages — banks' "recent" covers ~1 yr) → `-index.htm` Type `EX-99.1` (fallback filename `ex991`, any `EX-99.*`) → text without tables (kept if narrative < 1,500 chars), SGML header cut. Reuses `scraper.py` helpers. Records `date`/`text` like MD&A → `data/raw/press_releases/{T}.json`. Default 2016-07-01 → today. XOM 1 release, BLK 9 |
 | `src/data/labeler.py` | Default `--method direct`: yfinance `get_earnings_dates` (history back to ~2014, `lookback_quarters=40`) → one row per earnings announcement; `label = 1 if eps_actual < eps_estimate`. `date` = announcement date. Reads both `{T}.json` and `{T}/*.json` layouts, skips `_*` files |
@@ -52,9 +55,9 @@ python src/models/evaluate.py --data-root . --text press                        
 | `src/models/push_to_hub.py` | Trains swept fusion (seed 42, CPU, `evaluate.FUSION_CFG`), wraps in `HubFusionNet`, `save_pretrained` → `checkpoints/hub/earnings-miss-fusion/` + model card + `fusion_net.py`, asserts identical preds after `from_pretrained`. Uploads only with `--push --repo-id` (private unless `--public`); needs `hf auth login` |
 | `src/models/fusion.py` | `FusionNet` (imported from `fusion_net.py`): history (5) and MiniLM embed (384) blocks; `--fusion late` (per-block Linear+ReLU branches 5→8, 384→16, concat → MLP → 1 logit) or `early` (raw concat → MLP); `--blocks` for single-branch. Hand-written loop (no DataLoader): BCEWithLogits + `pos_weight`, AdamW 1e-3, early stop on val AUC (patience 20), best `state_dict` deepcopy, 5 seeds + seed-ensemble → `checkpoints/fusion/<config>/summary.json`. ~5 s per config |
 | `src/models/sweep.py` | W&B Bayesian sweep over late-fusion lr, weight_decay, branch dims, hidden, dropouts, batch size. Objective = mean val AUC over 3 seeds; never evaluates test. `--best ENTITY/PROJECT/ID` prints the `fusion.py` command for the winner (test once, `checkpoints/fusion/late_swept`). `--dry-run` works without login. Needs `wandb login` |
-| `src/models/evaluate.py` | Deep dive → `checkpoints/evaluation.json`, ~1 min: rolling-origin folds (test 2023 / 2024 / 2025–26, val = preceding year, train = all earlier) for LR history / embed / history+embed_pca16 / resid / history+resid_pca16 / delta / history+delta_pca16 / guidance / history+guidance / history+guidance+embed_pca16 + swept fusion (blocks via generic `make_blocks`, `_pcaN` suffix); `--text press` → `checkpoints/evaluation_press.json`; pooled AUC + paired-bootstrap ΔAUC vs history; F1 @0.5 vs val-tuned threshold, avg precision, precision in top 10%; company-held-out (GroupKFold by ticker vs random 5-fold, C from the 2025-26 fold; paired bootstrap ΔAUC vs history on the by-company predictions) |
+| `src/models/evaluate.py` | Deep dive → `checkpoints/evaluation.json`, ~1 min: rolling-origin folds (test 2023 / 2024 / 2025–26, val = preceding year, train = all earlier) for LR history / embed / history+embed_pca16 / resid / history+resid_pca16 / delta / history+delta_pca16 / guidance / history+guidance / history+guidance+embed_pca16 + swept fusion (blocks via generic `make_blocks`, `_pcaN` suffix); `--text press` → `checkpoints/evaluation_press.json`; `--companies all|original|expansion` (suffix `_original`, filter after `build_table`); sector one-hot block + `SECTOR_MODELS` with a second paired bootstrap vs `history+sector`; pooled AUC + paired-bootstrap ΔAUC vs history; F1 @0.5 vs val-tuned threshold, avg precision, precision in top 10%; company-held-out (GroupKFold by ticker vs random 5-fold, C from the 2025-26 fold; paired bootstrap ΔAUC vs history on the by-company predictions) |
 | `src/models/baselines.py` | Logistic regression (balanced, C ∈ 0.001–10 picked by val AUC) on feature blocks alone and combined: `history` (prior-quarter miss/surprise, 4q rolling stats, `shift(1)` so no leakage), `change`, `embed`, `embed_pca{8,16,32}` (PCA fit on train), `tfidf`; plus `avg(history,embed)`. Reports 95% bootstrap AUC range → `checkpoints/baselines.json`. ~1 min. `build_table(data_root, text="mda"|"press")` (incl. `ticker`; `TEXT_SOURCES` = dir, embedding cache, min gap) / `temporal_split` shared with `fusion.py`, `evaluate.py` |
-| `docs/` | Learning docs: `00-overview.md` (high-level) + one per component (`07-text-features.md` = embeddings/change features, `08-fusion-model.md` = fusion + manual loop, `09-wandb-sweeps.md`, `10-evaluation-deep-dive.md`, `11-huggingface-hub.md`, `12-press-releases.md`) |
+| `docs/` | Learning docs: `00-overview.md` (high-level) + one per component (`07-text-features.md` = embeddings/change features, `08-fusion-model.md` = fusion + manual loop, `09-wandb-sweeps.md`, `10-evaluation-deep-dive.md`, `11-huggingface-hub.md`, `12-press-releases.md`, `13-more-companies.md`) |
 | `notebooks/03_eda.ipynb` | EDA (label distribution, feature tests, correlations, temporal) |
 
 ## Key decisions
@@ -65,6 +68,8 @@ python src/models/evaluate.py --data-root . --text press                        
 - **Truncation**: MD&A is 5k–20k tokens; FinBERT sees the first 512 unless `--max-chunks` > 1. MiniLM embeddings always cover the whole filing.
 - **Press-release pairing**: releases are filed *on* announcement day and state its EPS; `min_transcript_gap_days=30` stops a release pairing with its own result (without it 3 samples leaked). Do not remove.
 - **Model selection**: by val AUC (never test); compare models with `evaluate.py` (rolling-origin + paired bootstrap).
+- **Text must beat history + sector**, not just history: with 10 sectors, sector carries base-rate signal that text picks up (it was most of the 49-company "guidance gain").
+- **REITs excluded** (Real Estate sector): Yahoo EPS labels are on mixed FFO/GAAP bases. Labels for new companies were fetched separately and appended, so original rows are unchanged.
 
 ## Current results
 
@@ -116,6 +121,17 @@ history+llm 0.665 (+0.012, P 0.67) / unseen 0.671 (+0.025 [−0.006, +0.055], P 
 better. Miss rate after EPS raise ≥3% 0/31; LLM "lowered" 11% (n 27) vs rules' cut 44%; confident tone 7–8% vs
 neutral 16.5%. Bottleneck = number of misses, not extraction.
 
+**188 companies (2026-10-29, `docs/13`):** press 6,916 samples / 1,161 misses, pooled test 2,816 / 469. history 0.655,
+history+sector 0.670 (+0.015, P 0.96), history+sector+guidance **0.676** (+0.021 [+0.002, +0.041]), fusion 0.676,
+history+guidance 0.662 (+0.007). Unseen companies: history+guidance +0.012 [+0.003, +0.022] (was +0.033),
+history+sector +0.015. **Over history+sector: guidance +0.006 [−0.004, +0.017] pooled, +0.004 unseen; embed
++0.001 / +0.008** → text adds nothing meaningful. On the original 50, history+sector alone = +0.033 unseen (= old
+guidance gain); guidance on top −0.010. MD&A (2,983 / 545; test 1,731 / 325): history 0.644, history+sector 0.664,
+history+guidance −0.002 (49-company +0.028 was noise), text over history+sector ≤ 0 pooled. Intervals ±0.05 →
+±0.02. Miss rate new companies: after raise 10.7% (699), net cut 27.8% (54), base 17%. Sector miss rates 8% (IT)
+– 29% (Materials). `--companies original` reproduces all earlier numbers. LLM models not run (new companies unscored).
+The 49-company tables above are kept for history.
+
 Takeaways: frozen text features + small model beat end-to-end FinBERT (too little data). Full-text
 embedding is the best text representation, but its signal is company identity; history drives the
 results, and text over history is not significant. Change features: no
@@ -123,12 +139,13 @@ signal. Neural late fusion > early fusion on val but < LR history+PCA-16; MLP un
 
 ## Open issues / next steps
 
-0. Day-2 learning plan in progress (user wants concept → code → explanation, one task at a time, wait for "ready"): Task 1 LoRA done (A: 512 tokens, B: whole-filing chunks); Task 2 fusion model + manual loop done; Task 3 W&B sweep, Task 4 evaluation deep dive done; Task 5 HF Hub done (public); Task 6 docs done. Day-2 plan complete. Day-3 (same style): step 1 within-company MD&A check done (null); step 2 = 8-K press releases done (some transferable signal, not significant over history; docs/12). Step 3 rule-based guidance features done (first significant gain, on unseen companies). Step 4 LLM-scored guidance done (= rules, no extra gain). Next: user decides (more companies/misses; MD&A+press combined; refresh HF model with guidance).
+0. Day-2 learning plan in progress (user wants concept → code → explanation, one task at a time, wait for "ready"): Task 1 LoRA done (A: 512 tokens, B: whole-filing chunks); Task 2 fusion model + manual loop done; Task 3 W&B sweep, Task 4 evaluation deep dive done; Task 5 HF Hub done (public); Task 6 docs done. Day-2 plan complete. Day-3 (same style): step 1 within-company MD&A check done (null); step 2 = 8-K press releases done (some transferable signal, not significant over history; docs/12). Step 3 rule-based guidance features done (first significant gain, on unseen companies). Step 4 LLM-scored guidance done (= rules, no extra gain). Step 5 more companies done (49 → 188; guidance gain mostly sector, text over history+sector n.s.). Next: user decides (refresh HF model with history+sector(+guidance); better history features e.g. estimate revisions; MD&A+press combined).
 1. Evaluate new models with `evaluate.py` (rolling-origin + paired bootstrap), not the single 23-miss window.
 2. More/better text: press releases done (1,848 samples). Call transcripts would be next but have no free source.
 3. Done: LLM-scored guidance via free NVIDIA API (`llm_guidance.py`) — matches the rules, no extra gain.
 4. Done: text signal is company identity (embed → chance on unseen companies). Text features need to be within-company (vs own past filings) or forward-looking (call Q&A, 8-K guidance) to add anything.
-5. Possible upgrades: stronger embedder (e.g. bge-base), Loughran-McDonald dictionary for tone features, gradient boosting.
+5. MD&A for the 7 big banks has 1 filing each (MD&A lives in an exhibit, scraper reads the 10-Q body only). Press releases are complete.
+6. Possible upgrades: stronger embedder (e.g. bge-base), Loughran-McDonald dictionary for tone features, gradient boosting.
 
 ## Reference
 
@@ -165,3 +182,4 @@ signal. Neural late fusion > early fusion on val but < LR history+PCA-16; MLP un
 - **2026-10-27** — Day-3 step 2: `src/data/press_releases.py` (8-K Item 2.02 EX-99.1, 2,115 releases, ~50 min); `dataset.py` `min_transcript_gap_days` (30 for press: without it 3 samples paired a release with its own result); `baselines.TEXT_SOURCES` + `build_table(text=)`; `evaluate.py --text press` → `evaluation_press.json`. 1,848 samples. history+embed +0.023 (P 0.84, n.s.), embed 0.58 on unseen companies (MD&A 0.48); resid/delta no signal. MD&A results unchanged. Added `docs/12-press-releases.md`; updated 00, 10, README.
 - **2026-10-27** — Day-3 step 3: `text_features.guidance_features` (rule-based outlook direction + hedging; rules tightened for precision by reading samples, not labels); `build_table` adds guidance cols; `evaluate.py` models guidance / history+guidance / history+guidance+embed_pca16, company-held-out paired bootstrap. Press: unseen-company Δ +0.033 [+0.004, +0.062] (first significant gain); rolling-origin +0.014 n.s. MD&A: history+guidance 0.720 (+0.028, P 0.92). Old models unchanged. Docs 12 (step 3 section), 07, 00, README.
 - **2026-10-28** — Day-3 step 4: `src/models/llm_guidance.py` (NVIDIA API, gpt-oss-20b, JSON schema, cached JSONL, ~4 h; timeout raised 120→300 s after 25% of calls timed out); `baselines.TEXT_SOURCES["press"]["llm"]` joins 9 LLM cols; `evaluate.py` 4 LLM models when present; `openai` in requirements. LLM ≈ rules: history+llm +0.012 pooled, +0.025 unseen (P 0.94) vs rules +0.014 / +0.033; combining adds nothing. Old models unchanged. Docs 12 (step 4), 00, README.
+- **2026-10-29** — Day-3 step 5: `src/data/universe.py` + committed `data/universe.csv` (50 + 150 S&P 500 by sector; Real Estate excluded for REIT label noise → 188 labeled companies). Scraped MD&A (2,529 new) and press releases (6,198 new); labels fetched to `labels_expansion.csv` and appended (originals byte-identical, backup `labels_original.csv`). `evaluate.py` `--companies`, sector block + `SECTOR_MODELS` + bootstrap vs history+sector; `build_table` drops LLM cols if >1% unscored. Press: history+sector+guidance 0.676; guidance over history+sector +0.006 (n.s.); unseen guidance gain +0.033 → +0.012, mostly sector. MD&A guidance gain was noise. Added `docs/13-more-companies.md`; updated 00, 12, README.

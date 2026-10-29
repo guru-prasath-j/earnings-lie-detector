@@ -2,6 +2,10 @@
 
 **Files:** `src/data/press_releases.py` (scraper), `src/models/llm_guidance.py` (step 4), `evaluate.py --text press` → `checkpoints/evaluation_press.json`
 
+> **Update (2026-10-29):** the results below are for the original 49 companies. With 188 companies
+> ([13](13-more-companies.md)) the guidance gain shrinks to +0.012 on unseen companies and is mostly a
+> sector effect; over history + sector, text adds ≤ +0.006 (not significant).
+
 ## Why press releases
 
 The MD&A turned out to carry company identity and nothing else ([10](10-evaluation-deep-dive.md) §4–5).
