@@ -43,7 +43,7 @@ MD&A and predicts **miss (1)** vs **met/beat (0)** for the company's next earnin
                                         ▼
             evaluate.py: test years 2023 / 2024 / 2025–26, paired bootstrap, unseen companies
                                         ▼
-                       push_to_hub.py → huggingface.co/Guruprasath12/lie-detect
+                       push_to_hub.py → huggingface.co/Guruprasath12/lie-detect (history + sector + guidance)
 ```
 
 | Step | File | Doc |
@@ -57,7 +57,7 @@ MD&A and predicts **miss (1)** vs **met/beat (0)** for the company's next earnin
 | 7. Fusion model (history + text, hand-written loop) | `src/models/fusion.py` | [08-fusion-model.md](08-fusion-model.md) |
 | 8. Hyperparameter sweep (W&B) | `src/models/sweep.py` | [09-wandb-sweeps.md](09-wandb-sweeps.md) |
 | 9. Evaluation deep dive (multi-year, paired bootstrap, unseen companies) | `src/models/evaluate.py` | [10-evaluation-deep-dive.md](10-evaluation-deep-dive.md) |
-| 10. Publish to the Hugging Face Hub | `src/models/fusion_net.py`, `push_to_hub.py` | [11-huggingface-hub.md](11-huggingface-hub.md) |
+| 10. Publish to the Hugging Face Hub | `src/models/fusion_net.py`, `miss_model.py`, `guidance_rules.py`, `push_to_hub.py` | [11-huggingface-hub.md](11-huggingface-hub.md) |
 | 11. Earnings press releases (8-K Ex. 99.1) as a second text source; guidance rules and LLM scores | `src/data/press_releases.py`, `evaluate.py --text press`, `llm_guidance.py` | [12-press-releases.md](12-press-releases.md) |
 | 12. More companies (49 → 188) and a sector baseline | `src/data/universe.py`, `evaluate.py --companies` | [13-more-companies.md](13-more-companies.md) |
 | (optional) Audio | `src/data/audio_*.py` | [06-audio-pipeline.md](06-audio-pipeline.md) |
@@ -109,6 +109,7 @@ carries most of it.
 | 11 | Rule-based guidance features (raised / cut / maintained / withdrawn, hedging) | **First significant gain:** +0.033 over history on unseen companies (P=0.99); over time +0.014–0.028, not significant. Works from MD&A too | [12](12-press-releases.md) |
 | 12 | LLM-scored guidance (gpt-oss-20b via NVIDIA API: EPS / revenue direction and size, tone) | Same as the rules (+0.012 over time, +0.025 unseen, P 0.94); combining both adds nothing. Raises ≥ 3%: 0 misses in 31 | [12](12-press-releases.md) |
 | 13 | 4× the companies (49 → 188, S&P 500 by sector; REITs excluded) and a sector baseline | Intervals ±0.05 → ±0.02. Guidance gain shrinks to +0.012 and is mostly sector; text over history + sector ≤ +0.006, n.s. | [13](13-more-companies.md) |
+| 14 | Re-published the Hub model as LR history + sector + guidance (chosen by val), rules shipped with it | Test 2025–26 AUC 0.671; card states text adds +0.006, n.s. | [11](11-huggingface-hub.md) |
 
 ### Headline numbers, 188 companies (press releases, rolling-origin test 2023–26: 2,816 samples, 469 misses)
 
@@ -134,10 +135,9 @@ Base rate 14.4%. All intervals include 0; with 5× fewer misses they are 2.5× w
 
 ## What's next
 
-1. **Refresh the Hugging Face model** to the honest best: history + sector (+ guidance), trained on 188 companies.
-2. **Better history features** are where the signal is: analyst-revision trends, estimate dispersion,
+1. **Better history features** are where the signal is: analyst-revision trends, estimate dispersion,
    the number of analysts (needs a data source beyond Yahoo's EPS table).
-3. Text with a different kind of information: earnings-call Q&A (no free source) rather than more
+2. Text with a different kind of information: earnings-call Q&A (no free source) rather than more
    ways of reading the same press release.
 
 ## Glossary

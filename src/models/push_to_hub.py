@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """
-Package the swept late-fusion model for the Hugging Face Hub.
+Package a model for the Hugging Face Hub.
 
-Steps:
-  1. Train it exactly as evaluated: sweep-winner config (``evaluate.FUSION_CFG``),
-     train < 2024, early-stopped on 2024, seed 42.
-  2. Wrap it in ``HubFusionNet`` with the train-set scaler statistics, so it takes raw features.
-  3. ``save_pretrained`` → ``config.json`` + ``model.safetensors``; add a model card
-     (README.md) and ``fusion_net.py`` (the class code needed to load it).
-  4. Reload with ``from_pretrained`` and check predictions are identical.
-  5. Only with ``--push``: create the repo (private unless ``--public``) and upload the folder.
+``--model miss`` (default, since 2026-10-29): logistic regression on history + sector + guidance
+rules, the best model on 188 companies (``docs/13``).  ``--model fusion``: the earlier swept
+late-fusion net (history + MD&A embedding, 49 companies; ``docs/11``).
+
+Steps (both models):
+  1. Train exactly as evaluated, and report the held-out test.
+     miss: C chosen on 2024 val (train < 2024), test 2025–26; then **refit on all years** with that C
+     for release.  fusion: sweep-winner config, train < 2024, early-stopped on 2024, seed 42.
+  2. Wrap it in ``HubMissModel`` / ``HubFusionNet`` with the train-set scaler statistics.
+  3. ``save_pretrained`` → ``config.json`` + ``model.safetensors``; add a model card (README.md)
+     and the class code needed to load it.
+  4. Reload with ``from_pretrained`` and check predictions are identical (miss: also from raw text).
+  5. Only with ``--push``: create the repo (private unless ``--public``) and upload the folder,
+     deleting the other model's code file from the repo.
 
 Usage:
     python src/models/push_to_hub.py --data-root .                       # build + verify locally
     hf auth login                                                        # once per machine
-    python src/models/push_to_hub.py --data-root . --repo-id USER/earnings-miss-fusion --push
+    python src/models/push_to_hub.py --data-root . --repo-id USER/lie-detect --push
 """
 
 from __future__ import annotations
@@ -36,6 +42,7 @@ from baselines import HISTORY_COLS  # noqa: E402
 from evaluate import FUSION_CFG  # noqa: E402
 from fusion import load_tensors, train_one  # noqa: E402
 from fusion_net import HubFusionNet  # noqa: E402
+from miss_model import HubMissModel, history_vector  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("push_to_hub")
@@ -146,17 +153,220 @@ Base rate 14.4%. Flagging the riskiest 10% of announcements each year finds miss
 """
 
 
+MISS_MODEL = "history+sector+guidance"  # picked by mean val AUC 2023/2024 (docs/13); no embedder needed
+
+
+def miss_card(repo_id: str, license_id: str, m: dict, ev: dict) -> str:
+    pooled, held = ev["pooled"], ev["company_holdout"]
+    me, hs, h = pooled[MISS_MODEL], pooled["history+sector"], pooled["history"]
+    vs = me["vs_history+sector"]
+    hv = held[MISS_MODEL]["vs_history+sector"]
+    hist_rows = "\n".join(f"| `{c}` | {HISTORY_DOC[c]} |" for c in HISTORY_COLS)
+    return f"""---
+license: {license_id}
+library_name: pytorch
+tags:
+- tabular-classification
+- finance
+- earnings
+- sec-filings
+- pytorch_model_hub_mixin
+metrics:
+- roc_auc
+---
+
+# Earnings miss predictor (track record + sector + guidance rules)
+
+Predicts the probability that a US company will **miss the consensus EPS estimate at its next
+quarterly earnings announcement**, about 90 days ahead, from:
+
+- its own recent **earnings surprises** (5 numbers),
+- its **GICS sector** (10 sectors; Real Estate not supported), and
+- what its latest **earnings press release** says about guidance: raised, cut, maintained,
+  narrowed, introduced or withdrawn, and how hedged the outlook is (10 numbers from regex rules).
+
+It is a **logistic regression** ({m['n_features']} features → 1 logit) wrapped as a PyTorch module. It was built as a
+learning project; the [GitHub repo](https://github.com/guru-prasath-j/earnings-lie-detector) has the
+full pipeline and the docs, including every idea that did *not* work.
+
+> **What the evaluation says:** almost all of the skill comes from the track record and the sector.
+> The press-release text adds **{vs['delta_vs_history+sector']:+.3f} AUC** on top of them, with a 95% interval of
+> [{vs['delta_ci95'][0]:+.3f}, {vs['delta_ci95'][1]:+.3f}], so it cannot be told apart from zero. The guidance features are
+> kept because they won on validation, not because they are proven to help.
+
+## Usage
+
+```python
+# pip install torch huggingface_hub numpy; download miss_model.py and guidance_rules.py from this repo
+from miss_model import HubMissModel
+
+model = HubMissModel.from_pretrained("{repo_id}")
+p_miss = model.predict(
+    past_surprises=[4.2, -1.5, 2.8, 6.0],   # EPS surprise % of earlier announcements, oldest → newest
+    sector="Industrials",                     # one of model.sectors
+    release_text=open("press_release.txt").read(),   # latest earnings press release (8-K Exhibit 99.1)
+)
+```
+
+`model.predict_proba(X)` takes a raw feature matrix in `model.features` order. Inputs are **raw**; the
+model standardises them with training-set statistics stored as buffers.
+
+**History features** (computed from announcements *before* the one predicted):
+
+| Feature | Definition |
+|---|---|
+{hist_rows}
+
+**Sector:** one-hot over `model.sectors` ({", ".join(m["sectors"])}).
+
+**Guidance features:** `guidance_rules.guidance_vector(text)` finds sentences mentioning
+guidance / outlook / forecast (minus boilerplate) and takes the direction verb closest to that noun.
+About 85% precise on spot checks. Use the text of the press release, without tables.
+
+## Training data
+
+- {m['n']:,} (press release, next announcement) pairs from {m['n_companies']} S&P 500 companies, 2017–2026;
+  {m['miss_rate']:.1%} misses. The release is filed on announcement day; it is paired with the *next*
+  announcement (83–98 days later), never its own.
+- Text: 8-K Item 2.02 Exhibit 99.1 from SEC EDGAR. Labels: EPS actual vs estimate from Yahoo Finance.
+  The data itself is **not** included here.
+- Logistic regression with balanced class weights; C = {m['C']} chosen on validation 2024 (train < 2024).
+  **The released weights are refit on all years** with that C.
+
+## Evaluation
+
+Held-out test 2025–26 with the train < 2024 model: AUC **{m['test_auc']:.3f}** ({m['test_n']:,} announcements,
+{m['test_miss']} misses).
+
+Rolling-origin test over 2023, 2024 and 2025–26 ({ev['_n']:,} announcements, {ev['_miss']} misses; each year
+predicted by a model trained only on earlier years):
+
+| Model | Pooled AUC | ΔAUC vs history [95%] | Precision in top 10% |
+|---|---|---|---|
+| history only | {h['auc']:.3f} | — | {h['prec_top10']:.0%} |
+| history + sector | {hs['auc']:.3f} | {hs['delta_vs_history']:+.3f} [{hs['delta_ci95'][0]:+.3f}, {hs['delta_ci95'][1]:+.3f}] | {hs['prec_top10']:.0%} |
+| **this model** | **{me['auc']:.3f}** | {me['delta_vs_history']:+.3f} [{me['delta_ci95'][0]:+.3f}, {me['delta_ci95'][1]:+.3f}] | {me['prec_top10']:.0%} |
+
+Base rate {ev['_base']:.1%}. On companies held out of training (5-fold by company), AUC is
+{held[MISS_MODEL]['by_company']:.3f}; guidance over history + sector there: {hv['delta_vs_history+sector']:+.3f}
+[{hv['delta_ci95'][0]:+.3f}, {hv['delta_ci95'][1]:+.3f}].
+
+## Limitations
+
+- **Modest skill.** AUC ≈ 0.68 ranks misses better than chance, not reliably. Flagging the riskiest
+  10% finds misses at {me["prec_top10"] / ev["_base"]:.1f}× the base rate.
+- **The text adds little:** see above. An LLM reading the same guidance passages did no better.
+- **Survivorship:** companies are today's S&P 500 members (plus 49 large caps); REITs are excluded
+  because their EPS labels mix FFO and GAAP bases.
+- Probabilities come from class-weighted training, so they are **not calibrated** (they overstate the
+  miss rate). Use them for ranking.
+- **Not investment advice.** Educational project only.
+"""
+
+
+def build_miss_model(args) -> None:
+    import pandas as pd
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import roc_auc_score
+    from sklearn.preprocessing import StandardScaler
+    from baselines import build_table
+    from evaluate import lr_fold
+    from text_features import GUIDANCE_COLS
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "data"))
+    from universe import load_sectors
+
+    df, _ = build_table(args.data_root, text="press")
+    sector = pd.get_dummies(df.ticker.map(load_sectors()), prefix="sec", dtype=float)
+    df = pd.concat([df, sector], axis=1)
+    sec_cols = list(sector.columns)
+    cols = {"history": HISTORY_COLS, "sector": sec_cols, "guidance": GUIDANCE_COLS}
+    feats = HISTORY_COLS + sec_cols + GUIDANCE_COLS
+
+    # 1a. evaluation protocol: train < 2024, C on 2024 val, test 2025–26 (same code as evaluate.py)
+    tr, va, te = df[df.date < "2024-01-01"], df[(df.date >= "2024-01-01") & (df.date < "2025-01-01")], df[df.date >= "2025-01-01"]
+    _, p_te, C = lr_fold(MISS_MODEL, tr, va, te, cols)
+    test_auc = roc_auc_score(te.label, p_te)
+    # 1b. release: refit on all years with that C
+    sc = StandardScaler().fit(df[feats])
+    clf = LogisticRegression(C=C, class_weight="balanced", max_iter=5000).fit(sc.transform(df[feats]), df.label)
+
+    # 2. wrap
+    hub = HubMissModel(features=feats, sectors=[c[len("sec_"):] for c in sec_cols], C=C)
+    with torch.no_grad():
+        hub.linear.weight.copy_(torch.as_tensor(clf.coef_, dtype=torch.float32))
+        hub.linear.bias.copy_(torch.as_tensor(clf.intercept_, dtype=torch.float32))
+        hub.mean.copy_(torch.as_tensor(sc.mean_, dtype=torch.float32))
+        hub.std.copy_(torch.as_tensor(sc.scale_, dtype=torch.float32))
+    p_sk = clf.predict_proba(sc.transform(df[feats]))[:, 1]
+    assert np.allclose(hub.predict_proba(df[feats].to_numpy()), p_sk, atol=1e-5), "wrapper changed the predictions"
+
+    # Raw path: history from past surprises + sector name + release text → same features as the table
+    labels = pd.read_csv(Path(args.data_root) / "data" / "processed" / "labels.csv").sort_values(["ticker", "date"])
+    sectors = load_sectors()
+    rows = df.sample(300, random_state=0)
+    for _, r in rows.iterrows():
+        past = labels[(labels.ticker == r.ticker) & (labels.date < r.date)].eps_surprise_pct.tolist()
+        raw = hub.feature_vector(past, sectors[r.ticker], r.text)
+        assert np.allclose(raw, r[feats].to_numpy(dtype=float), atol=1e-6), (r.ticker, r.date)
+    logger.info("Raw-input path matches the training table on %d sampled rows", len(rows))
+
+    # 3. save weights + config, card, class code
+    out = Path(args.out_dir or "checkpoints/hub/earnings-miss-model")
+    hub.save_pretrained(out)
+    ev_raw = json.loads(Path("checkpoints/evaluation_press.json").read_text())
+    base = ev_raw["pooled"]["_base_rate"]
+    n_test = sum(ev_raw["folds"][f]["n"][2] for f in ev_raw["folds"])
+    miss_test = sum(ev_raw["folds"][f]["miss"][2] for f in ev_raw["folds"])
+    ev = {**ev_raw, "_base": base, "_n": n_test, "_miss": miss_test}
+    m = {"n_features": len(feats), "sectors": hub.sectors, "n": len(df), "n_companies": df.ticker.nunique(),
+         "miss_rate": df.label.mean(), "C": C, "test_auc": test_auc, "test_n": len(te), "test_miss": int(te.label.sum())}
+    (out / "README.md").write_text(miss_card(args.repo_id, args.license, m, ev))
+    for f in ("miss_model.py", "guidance_rules.py"):
+        shutil.copy(Path(__file__).with_name(f), out / f)
+
+    # 4. round trip
+    reloaded = HubMissModel.from_pretrained(out)
+    assert np.allclose(reloaded.predict_proba(df[feats].to_numpy()), p_sk, atol=1e-5)
+    assert reloaded.features == feats and reloaded.sectors == hub.sectors
+    logger.info("Saved and verified %s: %s", out, sorted(f.name for f in out.iterdir()))
+    logger.info("C=%s  test 2025-26 AUC=%.3f (train<2024)  released: refit on %d rows, %d companies",
+                C, test_auc, len(df), df.ticker.nunique())
+    _push(args, out, "Upload earnings miss model (history + sector + guidance)", delete=["fusion_net.py"])
+
+
+def _push(args, out: Path, message: str, delete: list) -> None:
+    if not args.push:
+        return
+    if args.repo_id.startswith("USER/"):
+        sys.exit("Pass --repo-id <your-username>/<name>")
+    api = HfApi()
+    url = api.create_repo(args.repo_id, private=not args.public, exist_ok=True)
+    api.upload_folder(repo_id=args.repo_id, folder_path=out, commit_message=message, delete_patterns=delete)
+    logger.info("Pushed to %s (new repos are %s; existing repos keep their visibility)", url,
+                "public" if args.public else "private")
+
+
 def main() -> None:
-    p = argparse.ArgumentParser(description="Package the fusion model for the Hugging Face Hub")
+    p = argparse.ArgumentParser(description="Package a model for the Hugging Face Hub")
+    p.add_argument("--model", default="miss", choices=["miss", "fusion"],
+                   help="miss = LR history+sector+guidance (188 companies); fusion = earlier fusion net")
     p.add_argument("--data-root", default=".")
-    p.add_argument("--out-dir", default="checkpoints/hub/earnings-miss-fusion")
-    p.add_argument("--repo-id", default="USER/earnings-miss-fusion", help="Hub repo, e.g. alice/earnings-miss-fusion")
+    p.add_argument("--out-dir", default=None,
+                   help="default checkpoints/hub/earnings-miss-model (miss) / earnings-miss-fusion (fusion)")
+    p.add_argument("--repo-id", default="USER/lie-detect", help="Hub repo, e.g. alice/lie-detect")
     p.add_argument("--license", default="mit")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--push", action="store_true", help="Upload to the Hub (needs `hf auth login`)")
     p.add_argument("--public", action="store_true", help="Create the repo public (default: private)")
     args = p.parse_args()
+    if args.model == "miss":
+        build_miss_model(args)
+    else:
+        build_fusion(args)
 
+
+def build_fusion(args) -> None:
+    args.out_dir = args.out_dir or "checkpoints/hub/earnings-miss-fusion"
     device = torch.device("cpu")  # tiny model; CPU keeps saved tensors device-free
     cfg = SimpleNamespace(**FUSION_CFG)
 
@@ -196,13 +406,7 @@ def main() -> None:
                 result["val"]["auc"], result["test"]["auc"], result["test"]["f1"], m["n_params"])
 
     # 5. upload
-    if args.push:
-        if args.repo_id.startswith("USER/"):
-            sys.exit("Pass --repo-id <your-username>/<name>")
-        api = HfApi()
-        url = api.create_repo(args.repo_id, private=not args.public, exist_ok=True)
-        api.upload_folder(repo_id=args.repo_id, folder_path=out, commit_message="Upload earnings miss fusion model")
-        logger.info("Pushed to %s (%s)", url, "public" if args.public else "private")
+    _push(args, out, "Upload earnings miss fusion model", delete=["miss_model.py", "guidance_rules.py"])
 
 
 if __name__ == "__main__":

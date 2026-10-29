@@ -1,6 +1,7 @@
 # 11 — Publishing the model on the Hugging Face Hub
 
-**Files:** `src/models/fusion_net.py` (`FusionNet`, `HubFusionNet`), `src/models/push_to_hub.py`
+**Files:** `src/models/fusion_net.py` (`FusionNet`, `HubFusionNet`), `src/models/push_to_hub.py`;
+since 2026-10-29 also `src/models/miss_model.py` (`HubMissModel`) and `src/models/guidance_rules.py` (see the last section)
 
 ## What the Hub is
 
@@ -55,7 +56,7 @@ Fix: an explicit `blocks=["history", "embed"]` argument. Lists keep their order 
 ## Running it
 
 ```bash
-python src/models/push_to_hub.py --data-root .        # train, wrap, save, verify → checkpoints/hub/earnings-miss-fusion/
+python src/models/push_to_hub.py --data-root . --model fusion   # train, wrap, save, verify → checkpoints/hub/earnings-miss-fusion/
 hf auth login                                         # once per machine (token with write access)
 python src/models/push_to_hub.py --data-root . --repo-id Guruprasath12/lie-detect --push   # private
 python src/models/push_to_hub.py --data-root . --repo-id Guruprasath12/lie-detect --push --public  # public
@@ -68,3 +69,49 @@ because CPU and GPU random generators shuffle differently. Single-seed numbers m
 The model card reports this checkpoint's split metrics, the rolling-origin pooled numbers from
 `checkpoints/evaluation.json`, and the limitations, above all that the text part mostly encodes
 company identity. A model card's job is to stop people from over-trusting the model.
+
+(Since step 13 the MD&A table has 186 companies, so `--model fusion` now trains on more, harder data:
+val 0.673 / test 0.637. The numbers above are from the 49-company run.)
+
+## Version 2: the model the evidence supports (2026-10-29)
+
+After scaling to 188 companies ([13](13-more-companies.md)), the MD&A embedding added nothing, so the
+Hub repo now holds a different model: **logistic regression on history + sector + guidance rules**.
+
+**Choosing it.** By validation AUC (never test), averaged over the 2023 and 2024 validation years:
+history 0.656, history + sector 0.662, **history + sector + guidance 0.678**, + embedding 0.681. The
+embedding version is 0.003 higher, far inside the noise, and would need a 90 MB sentence-embedding model
+to run. The simpler model reads plain text with regex rules, so it was chosen, and the card says so.
+
+**A logistic regression as a Hub model.** LR is `Linear(25 → 1)` + sigmoid. `HubMissModel` copies
+sklearn's `coef_` / `intercept_` into an `nn.Linear` and the scaler's mean and std into buffers, then
+uses the same mixin as before. The checks in `push_to_hub.py`:
+
+1. The wrapper gives sklearn's probabilities on all 6,916 rows.
+2. **Raw-input path:** for 300 sampled rows, the features rebuilt from *past surprises + sector name +
+   release text* (what a user has) equal the training table's features. This catches any drift between
+   training code and shipped code.
+3. Round trip through `save_pretrained` / `from_pretrained`.
+
+**One copy of the rules.** The guidance regexes moved from `text_features.py` into `guidance_rules.py`
+(standard library only), which training imports and the Hub repo ships. Before moving them, the features
+for all 8,268 releases were saved, and after the move they were checked to be identical.
+
+**Evaluate, then refit.** C = 10 is chosen on 2024 validation (train < 2024), which gives test 2025–26
+AUC 0.671. The released weights are then **refit on all years** with that C: more data for the model
+people use, while the reported numbers still come from a model that never saw the test years.
+
+```bash
+python src/models/push_to_hub.py --data-root .                                          # miss model (default)
+python src/models/push_to_hub.py --data-root . --repo-id Guruprasath12/lie-detect --push
+```
+
+The upload deletes `fusion_net.py` from the repo (`delete_patterns`), so the repo never mixes two
+models' code. The fusion version is still in the Hub repo's commit history.
+
+```python
+from miss_model import HubMissModel        # with miss_model.py and guidance_rules.py downloaded
+model = HubMissModel.from_pretrained("Guruprasath12/lie-detect")
+model.predict(past_surprises=[3.0, 2.5, 4.1, 1.0], sector="Industrials", release_text=text)
+```
+

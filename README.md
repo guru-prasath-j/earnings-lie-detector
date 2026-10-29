@@ -52,8 +52,10 @@ The findings below are in the order we found them, including early gains that di
 | Models | FinBERT (frozen, LoRA, whole-filing chunking) · TF-IDF and MiniLM embeddings with logistic regression · history features · a PyTorch late-fusion network tuned with a W&B Bayesian sweep |
 | Evaluation | AUC and F1 (14% positives), bootstrap intervals, paired bootstrap for model differences, company-held-out cross-validation |
 
-The tuned fusion model is published on the Hugging Face Hub:
-[Guruprasath12/lie-detect](https://huggingface.co/Guruprasath12/lie-detect), with a model card covering its limitations.
+The best model (logistic regression on past surprises + sector + guidance rules, 188 companies, AUC 0.68)
+is published on the Hugging Face Hub: [Guruprasath12/lie-detect](https://huggingface.co/Guruprasath12/lie-detect).
+It takes a company's past EPS surprises, its sector and its latest press release text; the model card
+covers its limitations.
 
 ## Run it
 
