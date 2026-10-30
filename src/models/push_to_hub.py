@@ -153,15 +153,19 @@ Base rate 14.4%. Flagging the riskiest 10% of announcements each year finds miss
 """
 
 
-MISS_MODEL = "history+sector+guidance"  # picked by mean val AUC 2023/2024 (docs/13); no embedder needed
+# Picked by mean val AUC 2023/2024 (docs/14): 0.692 vs 0.682 without guidance, 0.677 without market data
+MISS_MODEL = "history+sector+analyst+price+guidance"
 
 
 def miss_card(repo_id: str, license_id: str, m: dict, ev: dict) -> str:
-    pooled, held = ev["pooled"], ev["company_holdout"]
+    pooled, held, folds = ev["pooled"], ev["company_holdout"], ev["folds"]
     me, hs, h = pooled[MISS_MODEL], pooled["history+sector"], pooled["history"]
     vs = me["vs_history+sector"]
     hv = held[MISS_MODEL]["vs_history+sector"]
     hist_rows = "\n".join(f"| `{c}` | {HISTORY_DOC[c]} |" for c in HISTORY_COLS)
+    year_rows = "\n".join(f"| {f} | {v['n'][2]:,} / {v['miss'][2]} | {v['history+sector']['auc']:.3f} | "
+                          f"{v[MISS_MODEL]['auc']:.3f} | {v[MISS_MODEL]['auc'] - v['history+sector']['auc']:+.3f} |"
+                          for f, v in folds.items())
     return f"""---
 license: {license_id}
 library_name: pytorch
@@ -175,13 +179,15 @@ metrics:
 - roc_auc
 ---
 
-# Earnings miss predictor (track record + sector + guidance rules)
+# Earnings miss predictor (track record, sector, analysts, price, guidance)
 
 Predicts the probability that a US company will **miss the consensus EPS estimate at its next
 quarterly earnings announcement**, about 90 days ahead, from:
 
 - its own recent **earnings surprises** (5 numbers),
-- its **GICS sector** (10 sectors; Real Estate not supported), and
+- its **GICS sector** (10 sectors; Real Estate not supported),
+- **analyst actions** in the 90 days before: rating changes and price targets raised or cut (4 numbers),
+- the stock's **run-up** vs the S&P 500 (SPY) over 1 and 3 months, and its volatility (3 numbers), and
 - what its latest **earnings press release** says about guidance: raised, cut, maintained,
   narrowed, introduced or withdrawn, and how hedged the outlook is (10 numbers from regex rules).
 
@@ -189,15 +195,16 @@ It is a **logistic regression** ({m['n_features']} features → 1 logit) wrapped
 learning project; the [GitHub repo](https://github.com/guru-prasath-j/earnings-lie-detector) has the
 full pipeline and the docs, including every idea that did *not* work.
 
-> **What the evaluation says:** almost all of the skill comes from the track record and the sector.
-> The press-release text adds **{vs['delta_vs_history+sector']:+.3f} AUC** on top of them, with a 95% interval of
-> [{vs['delta_ci95'][0]:+.3f}, {vs['delta_ci95'][1]:+.3f}], so it cannot be told apart from zero. The guidance features are
-> kept because they won on validation, not because they are proven to help.
+> **What the evaluation says:** most of the skill comes from the track record and the sector. On companies
+> the model never saw, analyst, price and guidance features add **{hv['delta_vs_history+sector']:+.3f} AUC** over those two
+> [{hv['delta_ci95'][0]:+.3f}, {hv['delta_ci95'][1]:+.3f}]. Forward in time the gain is **{vs['delta_vs_history+sector']:+.3f}**
+> [{vs['delta_ci95'][0]:+.3f}, {vs['delta_ci95'][1]:+.3f}]: it helped in 2023 and 2024 but not in 2025–26 (table below).
 
 ## Usage
 
 ```python
-# pip install torch huggingface_hub numpy; download miss_model.py and guidance_rules.py from this repo
+# pip install torch huggingface_hub numpy pandas yfinance
+# download miss_model.py, guidance_rules.py and market_features.py from this repo
 from miss_model import HubMissModel
 
 model = HubMissModel.from_pretrained("{repo_id}")
@@ -205,11 +212,14 @@ p_miss = model.predict(
     past_surprises=[4.2, -1.5, 2.8, 6.0],   # EPS surprise % of earlier announcements, oldest → newest
     sector="Industrials",                     # one of model.sectors
     release_text=open("press_release.txt").read(),   # latest earnings press release (8-K Exhibit 99.1)
+    ticker="CAT",                             # analyst actions and prices are fetched from Yahoo Finance
+    announcement_date="2026-11-04",           # the announcement being predicted (YYYY-MM-DD)
 )
 ```
 
-`model.predict_proba(X)` takes a raw feature matrix in `model.features` order. Inputs are **raw**; the
-model standardises them with training-set statistics stored as buffers.
+Pass `market_inputs=(analyst_actions, prices, spy_prices)` instead of `ticker` to use your own data
+(format: `market_features.market_vector`). `model.predict_proba(X)` takes a raw feature matrix in
+`model.features` order; the model standardises inputs with training-set statistics stored as buffers.
 
 **History features** (computed from announcements *before* the one predicted):
 
@@ -218,6 +228,11 @@ model standardises them with training-set statistics stored as buffers.
 {hist_rows}
 
 **Sector:** one-hot over `model.sectors` ({", ".join(m["sectors"])}).
+
+**Analyst and price features:** `market_features.market_vector`. Windows end 2 days before the
+announcement date, so the release and the reactions to it never leak in. Analyst actions (last 90 days):
+log count, upgrades − downgrades, share of price targets raised − lowered, mean % target change. Price:
+1- and 3-month return minus SPY's, 3-month volatility.
 
 **Guidance features:** `guidance_rules.guidance_vector(text)` finds sentences mentioning
 guidance / outlook / forecast (minus boilerplate) and takes the direction verb closest to that noun.
@@ -228,18 +243,15 @@ About 85% precise on spot checks. Use the text of the press release, without tab
 - {m['n']:,} (press release, next announcement) pairs from {m['n_companies']} S&P 500 companies, 2017–2026;
   {m['miss_rate']:.1%} misses. The release is filed on announcement day; it is paired with the *next*
   announcement (83–98 days later), never its own.
-- Text: 8-K Item 2.02 Exhibit 99.1 from SEC EDGAR. Labels: EPS actual vs estimate from Yahoo Finance.
+- Text: 8-K Item 2.02 Exhibit 99.1 from SEC EDGAR. Labels, analyst actions and prices: Yahoo Finance.
   The data itself is **not** included here.
 - Logistic regression with balanced class weights; C = {m['C']} chosen on validation 2024 (train < 2024).
   **The released weights are refit on all years** with that C.
 
 ## Evaluation
 
-Held-out test 2025–26 with the train < 2024 model: AUC **{m['test_auc']:.3f}** ({m['test_n']:,} announcements,
-{m['test_miss']} misses).
-
-Rolling-origin test over 2023, 2024 and 2025–26 ({ev['_n']:,} announcements, {ev['_miss']} misses; each year
-predicted by a model trained only on earlier years):
+Rolling-origin test: each year predicted by a model trained only on earlier years
+({ev['_n']:,} announcements, {ev['_miss']} misses):
 
 | Model | Pooled AUC | ΔAUC vs history [95%] | Precision in top 10% |
 |---|---|---|---|
@@ -247,15 +259,26 @@ predicted by a model trained only on earlier years):
 | history + sector | {hs['auc']:.3f} | {hs['delta_vs_history']:+.3f} [{hs['delta_ci95'][0]:+.3f}, {hs['delta_ci95'][1]:+.3f}] | {hs['prec_top10']:.0%} |
 | **this model** | **{me['auc']:.3f}** | {me['delta_vs_history']:+.3f} [{me['delta_ci95'][0]:+.3f}, {me['delta_ci95'][1]:+.3f}] | {me['prec_top10']:.0%} |
 
-Base rate {ev['_base']:.1%}. On companies held out of training (5-fold by company), AUC is
-{held[MISS_MODEL]['by_company']:.3f}; guidance over history + sector there: {hv['delta_vs_history+sector']:+.3f}
-[{hv['delta_ci95'][0]:+.3f}, {hv['delta_ci95'][1]:+.3f}].
+By test year:
+
+| Test year | Announcements / misses | history + sector | this model | Δ |
+|---|---|---|---|---|
+{year_rows}
+
+Base rate {ev['_base']:.1%}. On companies held out of training (5-fold by company): AUC
+{held[MISS_MODEL]['by_company']:.3f}, {hv['delta_vs_history+sector']:+.3f} [{hv['delta_ci95'][0]:+.3f}, {hv['delta_ci95'][1]:+.3f}] over history + sector. The analyst + price
+part of that gain (+0.019) is unchanged when each test row's own year is left out of training, so it
+is not a same-quarter market shock.
 
 ## Limitations
 
 - **Modest skill.** AUC ≈ 0.68 ranks misses better than chance, not reliably. Flagging the riskiest
   10% finds misses at {me["prec_top10"] / ev["_base"]:.1f}× the base rate.
-- **The text adds little:** see above. An LLM reading the same guidance passages did no better.
+- **The most recent test period (2025–26) shows no gain** over history + sector. With three test years
+  we can't tell a change in markets from noise.
+- **Depends on Yahoo Finance** at prediction time. Yahoo's analyst-action history is used as if it were
+  complete and unrevised; that isn't guaranteed.
+- **The text adds little** on its own; an LLM reading the same guidance passages did no better.
 - **Survivorship:** companies are today's S&P 500 members (plus 49 large caps); REITs are excluded
   because their EPS labels mix FFO and GAAP bases.
 - Probabilities come from class-weighted training, so they are **not calibrated** (they overstate the
@@ -271,6 +294,7 @@ def build_miss_model(args) -> None:
     from sklearn.preprocessing import StandardScaler
     from baselines import build_table
     from evaluate import lr_fold
+    from market_features import ANALYST_COLS, PRICE_COLS, _prices, market_vector, prepare_analyst, yahoo_inputs
     from text_features import GUIDANCE_COLS
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "data"))
     from universe import load_sectors
@@ -279,8 +303,10 @@ def build_miss_model(args) -> None:
     sector = pd.get_dummies(df.ticker.map(load_sectors()), prefix="sec", dtype=float)
     df = pd.concat([df, sector], axis=1)
     sec_cols = list(sector.columns)
-    cols = {"history": HISTORY_COLS, "sector": sec_cols, "guidance": GUIDANCE_COLS}
-    feats = HISTORY_COLS + sec_cols + GUIDANCE_COLS
+    cols = {"history": HISTORY_COLS, "sector": sec_cols, "guidance": GUIDANCE_COLS,
+            "analyst": ANALYST_COLS, "price": PRICE_COLS}
+    blocks = MISS_MODEL.split("+")
+    feats = [c for b in blocks for c in cols[b]]  # same order as evaluate.make_blocks
 
     # 1a. evaluation protocol: train < 2024, C on 2024 val, test 2025–26 (same code as evaluate.py)
     tr, va, te = df[df.date < "2024-01-01"], df[(df.date >= "2024-01-01") & (df.date < "2025-01-01")], df[df.date >= "2025-01-01"]
@@ -290,8 +316,11 @@ def build_miss_model(args) -> None:
     sc = StandardScaler().fit(df[feats])
     clf = LogisticRegression(C=C, class_weight="balanced", max_iter=5000).fit(sc.transform(df[feats]), df.label)
 
-    # 2. wrap
-    hub = HubMissModel(features=feats, sectors=[c[len("sec_"):] for c in sec_cols], C=C)
+    # 2. wrap; px_vol_63 of a new listing is filled with the training median (as market_features does)
+    market_dir = Path(args.data_root) / "data" / "raw" / "market"
+    vol_fill = float(df["px_vol_63"].median())
+    hub = HubMissModel(features=feats, sectors=[c[len("sec_"):] for c in sec_cols], C=C, blocks=blocks,
+                       fills={"px_rel_63": 0.0, "px_rel_21": 0.0, "px_vol_63": vol_fill})
     with torch.no_grad():
         hub.linear.weight.copy_(torch.as_tensor(clf.coef_, dtype=torch.float32))
         hub.linear.bias.copy_(torch.as_tensor(clf.intercept_, dtype=torch.float32))
@@ -300,15 +329,26 @@ def build_miss_model(args) -> None:
     p_sk = clf.predict_proba(sc.transform(df[feats]))[:, 1]
     assert np.allclose(hub.predict_proba(df[feats].to_numpy()), p_sk, atol=1e-5), "wrapper changed the predictions"
 
-    # Raw path: history from past surprises + sector name + release text → same features as the table
+    # Raw path: past surprises + sector name + release text + market inputs → same features as the table
     labels = pd.read_csv(Path(args.data_root) / "data" / "processed" / "labels.csv").sort_values(["ticker", "date"])
-    sectors = load_sectors()
+    sectors, spy, inputs = load_sectors(), _prices(market_dir, "SPY"), {}
     rows = df.sample(300, random_state=0)
     for _, r in rows.iterrows():
+        if r.ticker not in inputs:
+            f = market_dir / f"{r.ticker}_analyst.csv"
+            inputs[r.ticker] = (prepare_analyst(pd.read_csv(f)) if f.exists() else pd.DataFrame(),
+                                _prices(market_dir, r.ticker), spy)
         past = labels[(labels.ticker == r.ticker) & (labels.date < r.date)].eps_surprise_pct.tolist()
-        raw = hub.feature_vector(past, sectors[r.ticker], r.text)
+        raw = hub.feature_vector(past, sectors[r.ticker], r.text, announcement_date=r.date, market_inputs=inputs[r.ticker])
         assert np.allclose(raw, r[feats].to_numpy(dtype=float), atol=1e-6), (r.ticker, r.date)
     logger.info("Raw-input path matches the training table on %d sampled rows", len(rows))
+
+    # Live Yahoo fetch (what a user gets) vs the cached files, on a few recent rows
+    live = rows[rows.date >= "2024-01-01"].head(5)
+    for _, r in live.iterrows():
+        a = market_vector(*yahoo_inputs(r.ticker), r.date)
+        diff = max(abs(a[c] - r[c]) for c in ANALYST_COLS + PRICE_COLS)
+        logger.info("  live vs cached %s %s: max |diff| %.2g", r.ticker, r.date, diff)
 
     # 3. save weights + config, card, class code
     out = Path(args.out_dir or "checkpoints/hub/earnings-miss-model")
@@ -321,17 +361,17 @@ def build_miss_model(args) -> None:
     m = {"n_features": len(feats), "sectors": hub.sectors, "n": len(df), "n_companies": df.ticker.nunique(),
          "miss_rate": df.label.mean(), "C": C, "test_auc": test_auc, "test_n": len(te), "test_miss": int(te.label.sum())}
     (out / "README.md").write_text(miss_card(args.repo_id, args.license, m, ev))
-    for f in ("miss_model.py", "guidance_rules.py"):
+    for f in ("miss_model.py", "guidance_rules.py", "market_features.py"):
         shutil.copy(Path(__file__).with_name(f), out / f)
 
     # 4. round trip
     reloaded = HubMissModel.from_pretrained(out)
     assert np.allclose(reloaded.predict_proba(df[feats].to_numpy()), p_sk, atol=1e-5)
-    assert reloaded.features == feats and reloaded.sectors == hub.sectors
+    assert reloaded.features == feats and reloaded.sectors == hub.sectors and reloaded.blocks == blocks
     logger.info("Saved and verified %s: %s", out, sorted(f.name for f in out.iterdir()))
-    logger.info("C=%s  test 2025-26 AUC=%.3f (train<2024)  released: refit on %d rows, %d companies",
-                C, test_auc, len(df), df.ticker.nunique())
-    _push(args, out, "Upload earnings miss model (history + sector + guidance)", delete=["fusion_net.py"])
+    logger.info("%s  C=%s  test 2025-26 AUC=%.3f (train<2024)  released: refit on %d rows, %d companies",
+                MISS_MODEL, C, test_auc, len(df), df.ticker.nunique())
+    _push(args, out, f"Upload earnings miss model ({MISS_MODEL})", delete=["fusion_net.py"])
 
 
 def _push(args, out: Path, message: str, delete: list) -> None:

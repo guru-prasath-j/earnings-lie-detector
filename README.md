@@ -36,6 +36,10 @@ The findings below are in the order we found them, including early gains that di
   +0.012 on unseen companies, and most of it was a hidden **sector** effect: whether a company publishes
   an outlook depends on its industry. On top of history + sector, text adds ≤ +0.006 AUC (not significant).
   Best model: history + sector + guidance, AUC 0.676. Early gains on 49 companies were small-sample luck.
+- **The market says more than the text.** Analyst price-target changes and the stock's run-up in the 90
+  days before the announcement (point-in-time from Yahoo) add +0.019 [+0.011, +0.028] AUC over history +
+  sector on unseen companies, about 5× the text. Over time the gain is +0.005: it helps in 2023–24 but not
+  in 2025–26. Best pooled model: history + sector + analyst + price + guidance, AUC 0.680.
 - **Reading the whole document matters more than fine-tuning.** FinBERT on the first 512 tokens scores
   at chance. Reading 16 chunks of the filing lifts it to 0.60, and LoRA fine-tuning adds nothing on top.
   A frozen MiniLM embedding of the full text with logistic regression does better (0.70 on 2025–26).
@@ -52,10 +56,11 @@ The findings below are in the order we found them, including early gains that di
 | Models | FinBERT (frozen, LoRA, whole-filing chunking) · TF-IDF and MiniLM embeddings with logistic regression · history features · a PyTorch late-fusion network tuned with a W&B Bayesian sweep |
 | Evaluation | AUC and F1 (14% positives), bootstrap intervals, paired bootstrap for model differences, company-held-out cross-validation |
 
-The best model (logistic regression on past surprises + sector + guidance rules, 188 companies, AUC 0.68)
-is published on the Hugging Face Hub: [Guruprasath12/lie-detect](https://huggingface.co/Guruprasath12/lie-detect).
-It takes a company's past EPS surprises, its sector and its latest press release text; the model card
-covers its limitations.
+The best model (logistic regression on past surprises, sector, analyst actions, price run-up and guidance
+rules; 188 companies; pooled AUC 0.68) is published on the Hugging Face Hub:
+[Guruprasath12/lie-detect](https://huggingface.co/Guruprasath12/lie-detect). It takes a company's past EPS
+surprises, its sector, its latest press release text, and fetches analyst and price data from Yahoo
+Finance. The model card covers its limitations, including no gain over history + sector in 2025–26.
 
 ## Run it
 

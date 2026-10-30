@@ -44,6 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from dataset import EarningsCallDataset  # noqa: E402
 from text_features import CHANGE_COLS, GUIDANCE_COLS, change_features, document_embeddings, guidance_features  # noqa: E402
 from llm_guidance import LLM_COLS, llm_features  # noqa: E402
+from market_features import market_features  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("baselines")
@@ -174,7 +175,12 @@ def build_table(data_root: str, text: str = "mda") -> Tuple[pd.DataFrame, List[s
             **({c: float(llm.at[tk, c]) if tk in llm.index else 0.0 for c in LLM_COLS} if llm is not None else {}),
             **dict(zip(emb_cols, emb[tk])),
         })
-    return pd.DataFrame(rows), emb_cols
+    df = pd.DataFrame(rows)
+    market_dir = root / "data" / "raw" / "market"
+    if market_dir.exists():  # analyst actions + price run-up before the announcement (src/data/market_data.py)
+        mk = market_features(df[["ticker", "date"]].drop_duplicates(), market_dir)
+        df = df.join(mk, on=["ticker", "date"])
+    return df, emb_cols
 
 
 def temporal_split(df: pd.DataFrame, val_start: str, test_start: str) -> Dict[str, pd.DataFrame]:

@@ -62,6 +62,7 @@ from universe import load_sectors, load_universe  # noqa: E402
 from fusion import train_one  # noqa: E402
 from text_features import GUIDANCE_COLS, within_company_embeddings  # noqa: E402
 from llm_guidance import LLM_COLS  # noqa: E402
+from market_features import ANALYST_COLS, PRICE_COLS  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("evaluate")
@@ -83,6 +84,9 @@ LR_MODELS = [
 # information that text could pick up too. Text has to beat history+sector, not just history.
 SECTOR_MODELS = ["sector", "history+sector", "history+sector+guidance", "history+sector+embed_pca16",
                  "history+sector+guidance+embed_pca16"]
+# Point-in-time market data before the announcement (market_features.py; added when data/raw/market exists)
+MARKET_MODELS = ["analyst", "price", "history+sector+analyst", "history+sector+price", "history+sector+analyst+price",
+                 "history+sector+analyst+price+guidance"]
 # LLM-scored guidance (llm_guidance.py; press releases only, added when the scores exist)
 LLM_MODELS = ["llm", "history+llm", "history+guidance+llm", "history+llm+embed_pca16"]
 CS = (0.001, 0.01, 0.1, 1.0, 10.0)
@@ -200,8 +204,10 @@ def main() -> None:
     sector = pd.get_dummies(df.ticker.map(load_sectors()), prefix="sec", dtype=float)
     df = pd.concat([df, resid, delta, sector], axis=1)
     cols = {"history": HISTORY_COLS, "embed": emb_cols, "resid": list(resid.columns), "delta": list(delta.columns),
-            "guidance": GUIDANCE_COLS, "llm": LLM_COLS, "sector": list(sector.columns)}
-    lr_models = LR_MODELS + SECTOR_MODELS + (LLM_MODELS if set(LLM_COLS) <= set(df.columns) else [])
+            "guidance": GUIDANCE_COLS, "llm": LLM_COLS, "sector": list(sector.columns),
+            "analyst": ANALYST_COLS, "price": PRICE_COLS}
+    lr_models = (LR_MODELS + SECTOR_MODELS + (MARKET_MODELS if set(ANALYST_COLS) <= set(df.columns) else [])
+                 + (LLM_MODELS if set(LLM_COLS) <= set(df.columns) else []))
     models = lr_models + ([] if args.no_fusion else ["fusion_swept"])
     report: Dict = {"folds": {}, "pooled": {}, "company_holdout": {}}
 

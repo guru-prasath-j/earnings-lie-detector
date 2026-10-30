@@ -115,3 +115,32 @@ model = HubMissModel.from_pretrained("Guruprasath12/lie-detect")
 model.predict(past_surprises=[3.0, 2.5, 4.1, 1.0], sector="Industrials", release_text=text)
 ```
 
+## Version 3: adding analyst and price data (2026-10-29)
+
+After step 15 ([14](14-market-features.md)) the Hub model gained the analyst and price blocks:
+**history + sector + analyst + price + guidance**, 32 features.
+
+**Choosing it:** mean validation AUC (2023, 2024) 0.692, against 0.682 without guidance and 0.677 for
+version 2. A clear win on validation, so it replaced version 2, even though the forward-in-time test
+shows no gain in 2025–26. The card leads with that.
+
+**What changed in the package:**
+- `market_features.py` is shipped too (numpy + pandas). The per-announcement calculation became
+  `market_vector(analyst, prices, spy, date)`, used by training and inference alike. Before the refactor
+  the features for all 7,089 announcements were saved and afterwards checked identical.
+- `HubMissModel` gained two config fields: `blocks` (which feature groups it uses) and `fills`
+  (training values for missing inputs, such as a new listing's volatility). Version 2 configs still load.
+- `predict(..., ticker=, announcement_date=)` fetches analyst actions and prices from Yahoo with
+  `yahoo_inputs`. `market_inputs=` takes your own data instead.
+
+**Checks added to `push_to_hub.py`:** the raw-input path now includes the market blocks (300 rows), and a
+**live Yahoo fetch** is compared with the cached training files on 5 recent announcements (max
+difference ~1e-7). That catches the risk that what users fetch differs from what the model was trained on.
+
+```python
+from miss_model import HubMissModel   # with miss_model.py, guidance_rules.py, market_features.py downloaded
+model = HubMissModel.from_pretrained("Guruprasath12/lie-detect")
+model.predict(past_surprises=[4.2, -1.5, 2.8, 6.0], sector="Industrials", release_text=text,
+              ticker="CAT", announcement_date="2026-11-04")
+```
+
